@@ -1,13 +1,16 @@
 /**
- * 三消游戏 - 阶段 1.1（微信小游戏）
- * 滑动交换、消除/掉落/填充动画、泡泡立体效果
+ * 三消游戏 - 阶段三（微信小游戏）
+ * 多目标、收集进度、墙与障碍
  */
 
 const COLS = 8;
 const ROWS = 8;
 const GEM_TYPES = 5;
+const WALL = -2; // 墙格，不参与交换/消除/下落
+const HUD_TOP_MARGIN = 98; // 顶部预留给 HUD，避免与棋盘重叠
 
 const COLORS = ['#e74c3c', '#3498db', '#2ecc71', '#f1c40f', '#9b59b6'];
+var COLOR_NAMES = ['红', '蓝', '绿', '黄', '紫'];
 
 // 动画时长（秒）
 const DUR_SWAP = 0.15;
@@ -28,6 +31,53 @@ let touchStartX = 0;
 let touchStartY = 0;
 
 const MIN_SWIPE_PX = 18; // 最小滑动距离（像素），小于则视为点击忽略
+
+// 关卡配置（阶段二/三）：id, moves, targetScore, goals, grid, walls, ice 可选
+var LEVELS = [
+  { id: 1, moves: 20, targetScore: 500 },
+  { id: 2, moves: 18, targetScore: 600 },
+  { id: 3, moves: 16, targetScore: 700 },
+  { id: 4, moves: 15, targetScore: 800 },
+  { id: 5, moves: 14, targetScore: 1000 },
+  { id: 6, moves: 22, goals: [{ type: 'score', value: 600 }, { type: 'collect', color: 0, amount: 15 }] },
+  { id: 7, moves: 20, goals: [{ type: 'collect', color: 1, amount: 20 }, { type: 'collect', color: 2, amount: 18 }] },
+  { id: 8, moves: 18, targetScore: 800, walls: [[0, 3], [0, 4], [7, 3], [7, 4]] },
+  { id: 9, moves: 20, goals: [{ type: 'score', value: 700 }, { type: 'collect', color: 3, amount: 12 }], walls: [[3, 2], [3, 5], [4, 2], [4, 5]] },
+  { id: 10, moves: 18, targetScore: 600, ice: [[2, 2, 1], [2, 5, 1], [5, 2, 1], [5, 5, 1]] }
+];
+
+function getLevelConfig(levelId) {
+  var idx = levelId - 1;
+  if (idx < 0 || idx >= LEVELS.length) return null;
+  var config = LEVELS[idx];
+  if (!config.goals) config.goals = [{ type: 'score', value: config.targetScore != null ? config.targetScore : 500 }];
+  return config;
+}
+
+function allGoalsMet() {
+  for (var i = 0; i < currentGoals.length; i++) {
+    var g = currentGoals[i];
+    if (g.type === 'score') {
+      if (score < g.value) return false;
+    } else if (g.type === 'collect') {
+      var key = 'collect_' + g.color;
+      if ((goalProgress[key] || 0) < g.amount) return false;
+    }
+  }
+  return true;
+}
+
+// 关卡状态
+var currentLevelId = 1;
+var movesLeft = 20;
+var score = 0;
+var targetScore = 500;
+var currentGoals = []; // 当前关 goals，来自 getLevelConfig
+var goalProgress = {}; // collect_0..collect_4 收集数量
+var overlay = null; // null | 'win' | 'fail'
+var comboIndex = 0; // 连消序号，用于计分加成
+var wallGrid = []; // wallGrid[r][c] === true 表示墙
+var iceGrid = []; // iceGrid[r][c] 为冰块血量，0 表示无
 
 // 交换动画：两格互换
 let swapAnim = null; // { r1, c1, r2, c2, progress }
@@ -51,9 +101,10 @@ function initCanvas() {
   const h = sys.windowHeight || 375;
   canvas.width = w;
   canvas.height = h;
-  cellSize = Math.min(w, h) / 8;
+  var playH = h - HUD_TOP_MARGIN;
+  cellSize = Math.min(w, playH) / 8;
   offsetX = (w - cellSize * 8) / 2;
-  offsetY = (h - cellSize * 8) / 2;
+  offsetY = HUD_TOP_MARGIN + (playH - cellSize * 8) / 2;
   ctx = canvas.getContext('2d');
 }
 
@@ -67,6 +118,77 @@ function initGrid() {
       }
     }
   } while (getMatches().length > 0);
+}
+
+function initGridFromData(gridData) {
+  grid = [];
+  for (let r = 0; r < ROWS; r++) {
+    grid[r] = [];
+    for (let c = 0; c < COLS; c++) {
+      var val = gridData[r][c];
+      grid[r][c] = typeof val === 'number' && val >= 0 && val < GEM_TYPES ? val : Math.floor(Math.random() * GEM_TYPES);
+    }
+  }
+}
+
+function startLevel(levelId) {
+  var config = getLevelConfig(levelId);
+  if (!config) return;
+  currentLevelId = levelId;
+  movesLeft = config.moves;
+  score = 0;
+  var scoreGoal = null;
+  if (config.goals && config.goals.length) {
+    for (var g = 0; g < config.goals.length; g++) {
+      if (config.goals[g].type === 'score') { scoreGoal = config.goals[g]; break; }
+    }
+  }
+  targetScore = scoreGoal ? scoreGoal.value : (config.targetScore || 500);
+  currentGoals = config.goals || [{ type: 'score', value: config.targetScore || 500 }];
+  goalProgress = {};
+  for (var c = 0; c < GEM_TYPES; c++) goalProgress['collect_' + c] = 0;
+  overlay = null;
+  comboIndex = 0;
+  state = 'idle';
+  swapAnim = null;
+  eliminateAnim = null;
+  dropAnims = [];
+  fillAnims = [];
+  animating = false;
+  lastTime = 0;
+  wallGrid = [];
+  for (var r = 0; r < ROWS; r++) {
+    wallGrid[r] = [];
+    for (var c = 0; c < COLS; c++) wallGrid[r][c] = false;
+  }
+  if (config.walls && config.walls.length) {
+    for (var i = 0; i < config.walls.length; i++) {
+      var w = config.walls[i];
+      if (w[0] >= 0 && w[0] < ROWS && w[1] >= 0 && w[1] < COLS) wallGrid[w[0]][w[1]] = true;
+    }
+  }
+  iceGrid = [];
+  for (var r = 0; r < ROWS; r++) {
+    iceGrid[r] = [];
+    for (var c = 0; c < COLS; c++) iceGrid[r][c] = 0;
+  }
+  if (config.ice && config.ice.length) {
+    for (var i = 0; i < config.ice.length; i++) {
+      var ic = config.ice[i];
+      if (ic[0] >= 0 && ic[0] < ROWS && ic[1] >= 0 && ic[1] < COLS && ic[2] > 0) iceGrid[ic[0]][ic[1]] = ic[2];
+    }
+  }
+  if (config.grid && config.grid.length >= ROWS) {
+    initGridFromData(config.grid);
+  } else {
+    initGrid();
+  }
+  for (var r = 0; r < ROWS; r++) {
+    for (var c = 0; c < COLS; c++) {
+      if (wallGrid[r][c]) grid[r][c] = WALL;
+    }
+  }
+  render();
 }
 
 function getMatches() {
@@ -101,6 +223,7 @@ function getMatches() {
 }
 
 function swap(r1, c1, r2, c2) {
+  if (isWall(r1, c1) || isWall(r2, c2)) return;
   const t = grid[r1][c1];
   grid[r1][c1] = grid[r2][c2];
   grid[r2][c2] = t;
@@ -113,31 +236,34 @@ function isAdjacent(r1, c1, r2, c2) {
 }
 
 function removeMatches(matches) {
-  for (let i = 0; i < matches.length; i++) {
-    const m = matches[i];
-    grid[m.row][m.col] = -1;
+  for (var i = 0; i < matches.length; i++) {
+    var m = matches[i];
+    var r = m.row, c = m.col;
+    if (iceGrid[r] && iceGrid[r][c] > 0) iceGrid[r][c]--;
+    grid[r][c] = -1;
   }
 }
 
 function drop() {
-  for (let c = 0; c < COLS; c++) {
-    let write = ROWS - 1;
-    for (let r = ROWS - 1; r >= 0; r--) {
-      if (grid[r][c] >= 0) {
-        if (write !== r) {
-          grid[write][c] = grid[r][c];
-          grid[r][c] = -1;
-        }
-        write--;
-      }
+  for (var c = 0; c < COLS; c++) {
+    var targetRows = [];
+    for (var r = ROWS - 1; r >= 0; r--) {
+      if (!isWall(r, c)) targetRows.push(r);
+    }
+    var gems = [];
+    for (var r = ROWS - 1; r >= 0; r--) {
+      if (!isWall(r, c) && grid[r][c] >= 0) gems.push(grid[r][c]);
+    }
+    for (var i = 0; i < targetRows.length; i++) {
+      grid[targetRows[i]][c] = i < gems.length ? gems[i] : -1;
     }
   }
 }
 
 function refill() {
-  for (let r = 0; r < ROWS; r++) {
-    for (let c = 0; c < COLS; c++) {
-      if (grid[r][c] < 0) grid[r][c] = Math.floor(Math.random() * GEM_TYPES);
+  for (var r = 0; r < ROWS; r++) {
+    for (var c = 0; c < COLS; c++) {
+      if (!isWall(r, c) && grid[r][c] < 0 && (iceGrid[r][c] || 0) === 0) grid[r][c] = Math.floor(Math.random() * GEM_TYPES);
     }
   }
 }
@@ -145,41 +271,45 @@ function refill() {
 
 function buildDropAnimsCorrect() {
   dropAnims = [];
-  const before = [];
-  for (let c = 0; c < COLS; c++) {
-    before[c] = [];
-    for (let r = ROWS - 1; r >= 0; r--) {
-      if (grid[r][c] >= 0) before[c].push({ r: r, type: grid[r][c] });
+  for (var c = 0; c < COLS; c++) {
+    var targetRows = [];
+    for (var r = ROWS - 1; r >= 0; r--) {
+      if (!isWall(r, c)) targetRows.push(r);
     }
-  }
-  drop();
-  for (let c = 0; c < COLS; c++) {
-    const list = before[c];
-    for (let i = 0; i < list.length; i++) {
-      const toR = ROWS - 1 - i;
+    var gems = [];
+    for (var r = ROWS - 1; r >= 0; r--) {
+      if (!isWall(r, c) && grid[r][c] >= 0) gems.push({ r: r, type: grid[r][c] });
+    }
+    for (var i = 0; i < gems.length; i++) {
+      var toR = targetRows[i];
       dropAnims.push({
-        fromR: list[i].r,
+        fromR: gems[i].r,
         fromC: c,
         toR: toR,
         toC: c,
-        type: list[i].type,
+        type: gems[i].type,
         progress: 0
       });
     }
   }
+  drop();
 }
 
 function buildFillAnims() {
   fillAnims = [];
-  for (let r = 0; r < ROWS; r++) {
-    for (let c = 0; c < COLS; c++) {
-      if (grid[r][c] < 0) {
-        const type = Math.floor(Math.random() * GEM_TYPES);
+  for (var r = 0; r < ROWS; r++) {
+    for (var c = 0; c < COLS; c++) {
+      if (!isWall(r, c) && grid[r][c] < 0 && (iceGrid[r][c] || 0) === 0) {
+        var type = Math.floor(Math.random() * GEM_TYPES);
         grid[r][c] = type;
         fillAnims.push({ r: r, c: c, type: type, progress: 0 });
       }
     }
   }
+}
+
+function isWall(r, c) {
+  return r >= 0 && r < ROWS && c >= 0 && c < COLS && (wallGrid[r] && wallGrid[r][c]);
 }
 
 function getCellFromTouch(clientX, clientY) {
@@ -204,6 +334,7 @@ function getAdjacentCellByDirection(r1, c1, dx, dy) {
     r2 = r1 + (dy > 0 ? 1 : -1);
   }
   if (r2 < 0 || r2 >= ROWS || c2 < 0 || c2 >= COLS) return null;
+  if (isWall(r2, c2)) return null;
   return { row: r2, col: c2 };
 }
 
@@ -220,12 +351,18 @@ function onTouchStart(e) {
   const x = touch.clientX != null ? touch.clientX : touch.x;
   const y = touch.clientY != null ? touch.clientY : touch.y;
   touchStartCell = getCellFromTouch(x, y);
+  if (touchStartCell && isWall(touchStartCell.row, touchStartCell.col)) touchStartCell = null;
   touchStartX = x;
   touchStartY = y;
 }
 
 function onTouchEnd(e) {
   if (state !== 'idle') return;
+  if (overlay === 'win' || overlay === 'fail') {
+    handleOverlayTouch(e);
+    return;
+  }
+  if (movesLeft <= 0) return;
   const touch = e.changedTouches && e.changedTouches[0];
   if (!touch) return;
   const endX = touch.clientX != null ? touch.clientX : touch.x;
@@ -263,11 +400,14 @@ function onTouchEnd(e) {
 
   clearTouch();
   if (r1 === r2 && c1 === c2) return;
+  if (isWall(r1, c1) || isWall(r2, c2)) return;
 
+  movesLeft--;
   swap(r1, c1, r2, c2);
   const hadMatch = getMatches().length > 0;
   if (!hadMatch) {
     swap(r1, c1, r2, c2);
+    movesLeft++;
     render();
     return;
   }
@@ -278,6 +418,26 @@ function onTouchEnd(e) {
 
 function onTouchCancel() {
   clearTouch();
+}
+
+var btnNextRect = null;
+var btnRetryRect = null;
+
+function handleOverlayTouch(e) {
+  var touch = e.changedTouches && e.changedTouches[0];
+  if (!touch) return;
+  var x = touch.clientX != null ? touch.clientX : touch.x;
+  var y = touch.clientY != null ? touch.clientY : touch.y;
+  if (overlay === 'win' && btnNextRect && x >= btnNextRect.x && x <= btnNextRect.x + btnNextRect.w && y >= btnNextRect.y && y <= btnNextRect.y + btnNextRect.h) {
+    var nextId = currentLevelId + 1;
+    if (getLevelConfig(nextId)) {
+      startLevel(nextId);
+    } else {
+      startLevel(1);
+    }
+  } else if (overlay === 'fail' && btnRetryRect && x >= btnRetryRect.x && x <= btnRetryRect.x + btnRetryRect.w && y >= btnRetryRect.y && y <= btnRetryRect.y + btnRetryRect.h) {
+    startLevel(currentLevelId);
+  }
 }
 
 function gameLoop(now) {
@@ -302,6 +462,16 @@ function gameLoop(now) {
   if (state === 'eliminating' && eliminateAnim) {
     eliminateAnim.progress += dt / DUR_ELIMINATE;
     if (eliminateAnim.progress >= 1) {
+      comboIndex++;
+      var addScore = eliminateAnim.matches.length * 10 * comboIndex;
+      score += addScore;
+      for (var i = 0; i < eliminateAnim.matches.length; i++) {
+        var m = eliminateAnim.matches[i];
+        if (m.type >= 0 && m.type < GEM_TYPES) {
+          var key = 'collect_' + m.type;
+          goalProgress[key] = (goalProgress[key] || 0) + 1;
+        }
+      }
       removeMatches(eliminateAnim.matches.map(function (m) { return { row: m.row, col: m.col }; }));
       buildDropAnimsCorrect();
       eliminateAnim = null;
@@ -338,9 +508,15 @@ function gameLoop(now) {
         state = 'eliminating';
         eliminateAnim = { matches: next, progress: 0 };
       } else {
+        comboIndex = 0;
         state = 'idle';
         animating = false;
         lastTime = 0;
+        if (allGoalsMet()) {
+          overlay = 'win';
+        } else if (movesLeft <= 0) {
+          overlay = 'fail';
+        }
         render();
         return;
       }
@@ -403,6 +579,27 @@ function render() {
   const h = canvas.height;
   ctx.fillStyle = '#16213e';
   ctx.fillRect(0, 0, w, h);
+
+  var hudY = 14;
+  var lineH = 16;
+  ctx.fillStyle = '#eee';
+  ctx.font = '13px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('步数: ' + movesLeft, offsetX, hudY);
+  for (var i = 0; i < currentGoals.length; i++) {
+    var goal = currentGoals[i];
+    var y = hudY + (i + 1) * lineH;
+    if (goal.type === 'score') {
+      ctx.fillStyle = '#eee';
+      ctx.fillText('分数: ' + score + ' / ' + goal.value, offsetX, y);
+    } else if (goal.type === 'collect') {
+      var prog = goalProgress['collect_' + goal.color] || 0;
+      var name = COLOR_NAMES[goal.color] != null ? COLOR_NAMES[goal.color] : ('色' + goal.color);
+      ctx.fillStyle = COLORS[goal.color] || '#eee';
+      ctx.fillText(name + ': ' + prog + ' / ' + goal.amount, offsetX, y);
+    }
+  }
+  ctx.fillStyle = '#eee';
 
   const pad = 2;
   const elimSet = eliminateAnim ? new Set(eliminateAnim.matches.map(function (m) { return m.row + ',' + m.col; })) : null;
@@ -477,11 +674,54 @@ function render() {
       const x = offsetX + c * cellSize;
       const y = offsetY + r * cellSize;
       const key = r + ',' + c;
-      if (grid[r][c] < 0 && (!fillSet || !fillSet.has(key)) && (!dropTargetSet || !dropTargetSet.has(key))) {
-        ctx.fillStyle = 'rgba(255,255,255,0.08)';
+      if (isWall(r, c)) {
+        ctx.fillStyle = '#3d3d5c';
+        ctx.fillRect(x + 2, y + 2, cellSize - 4, cellSize - 4);
+        ctx.strokeStyle = '#5c5c8a';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x + 2, y + 2, cellSize - 4, cellSize - 4);
+      } else if (grid[r][c] < 0 && (!fillSet || !fillSet.has(key)) && (!dropTargetSet || !dropTargetSet.has(key))) {
+        ctx.fillStyle = (iceGrid[r] && iceGrid[r][c] > 0) ? 'rgba(200,230,255,0.4)' : 'rgba(255,255,255,0.08)';
         ctx.fillRect(x, y, cellSize, cellSize);
       }
     }
+  }
+
+  if (overlay === 'win' || overlay === 'fail') {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, w, h);
+    var panelW = 220;
+    var panelH = 100;
+    var panelX = (w - panelW) / 2;
+    var panelY = (h - panelH) / 2;
+    ctx.fillStyle = '#2a2a4a';
+    ctx.fillRect(panelX, panelY, panelW, panelH);
+    ctx.strokeStyle = '#eee';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(panelX, panelY, panelW, panelH);
+    ctx.fillStyle = '#eee';
+    ctx.font = '18px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(overlay === 'win' ? '胜利！' : '步数用尽', w / 2, panelY + 32);
+    var btnW = 100;
+    var btnH = 36;
+    var btnX = (w - btnW) / 2;
+    var btnY = panelY + 52;
+    ctx.fillStyle = '#4a7c59';
+    ctx.fillRect(btnX, btnY, btnW, btnH);
+    ctx.fillStyle = '#fff';
+    ctx.font = '16px sans-serif';
+    ctx.fillText(overlay === 'win' ? '下一关' : '重试', w / 2, btnY + 24);
+    if (overlay === 'win') {
+      btnNextRect = { x: btnX, y: btnY, w: btnW, h: btnH };
+      btnRetryRect = null;
+    } else {
+      btnRetryRect = { x: btnX, y: btnY, w: btnW, h: btnH };
+      btnNextRect = null;
+    }
+  } else {
+    btnNextRect = null;
+    btnRetryRect = null;
   }
 }
 
@@ -493,9 +733,8 @@ function bindTouch() {
 
 function main() {
   initCanvas();
-  initGrid();
   bindTouch();
-  render();
+  startLevel(1);
 }
 
 main();
