@@ -1,0 +1,9 @@
+# 微信开发者工具
+project.private.config.json
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
