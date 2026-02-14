@@ -8,6 +8,13 @@ var RANK_KEY = 'score';
 var list = [];
 var loading = true;
 var errMsg = '';
+var FONT_FAMILY = '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", sans-serif';
+if (typeof wx !== 'undefined' && wx.loadFont) {
+  try {
+    var loaded = wx.loadFont('fonts/cartoon.ttf') || wx.loadFont('fonts/ZCOOLKuaiLe-Regular.ttf');
+    if (loaded && typeof loaded === 'string') FONT_FAMILY = loaded;
+  } catch (e) {}
+}
 
 function drawRank() {
   var w = sharedCanvas.width || 300;
@@ -15,7 +22,7 @@ function drawRank() {
   ctx.fillStyle = '#16213e';
   ctx.fillRect(0, 0, w, h);
   ctx.fillStyle = '#eee';
-  ctx.font = '16px sans-serif';
+  ctx.font = '16px ' + FONT_FAMILY;
   ctx.textAlign = 'center';
   if (loading) {
     ctx.fillText('加载中…', w / 2, h / 2);
@@ -79,8 +86,96 @@ function fetchAndDraw() {
   });
 }
 
+var minipanelW = 200;
+var minipanelH = 52;
+function drawMinipanel(rank, gapAbove) {
+  var w = sharedCanvas.width || minipanelW;
+  var h = sharedCanvas.height || minipanelH;
+  ctx.fillStyle = 'rgba(22,33,62,0.92)';
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = '#4a7c9e';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(0, 0, w, h);
+  ctx.fillStyle = '#fff';
+  ctx.font = '14px ' + FONT_FAMILY;
+  ctx.textAlign = 'left';
+  if (rank === 'timeout' || rank === 'nocontext') {
+    ctx.fillText('好友排名', 10, 20);
+    ctx.font = '12px ' + FONT_FAMILY;
+    ctx.fillText(rank === 'timeout' ? '加载超时，请真机试玩' : '仅真机显示排名', 10, 40);
+    return;
+  }
+  ctx.fillText('好友排名: 第' + rank + '名', 10, 20);
+  if (gapAbove != null && gapAbove > 0) {
+    ctx.fillText('距上一名: ' + gapAbove + '分', 10, 40);
+  } else {
+    ctx.fillText('已是第1名', 10, 40);
+  }
+}
+function fetchAndDrawMinipanel(myScore) {
+  if (myScore == null || typeof myScore !== 'number') myScore = 0;
+  loading = true;
+  list = [];
+  var w = sharedCanvas.width || minipanelW;
+  var h = sharedCanvas.height || minipanelH;
+  ctx.fillStyle = 'rgba(22,33,62,0.92)';
+  ctx.fillRect(0, 0, w, h);
+  ctx.fillStyle = '#eee';
+  ctx.font = '12px ' + FONT_FAMILY;
+  ctx.textAlign = 'center';
+  ctx.fillText('加载排名…', w / 2, h / 2);
+  var resolved = false;
+  function finish() {
+    if (resolved) return;
+    resolved = true;
+    if (minipanelLoadTimer) clearTimeout(minipanelLoadTimer);
+  }
+  var minipanelLoadTimer = setTimeout(function () {
+    finish();
+    loading = false;
+    drawMinipanel('timeout', null);
+  }, 2500);
+  wx.getFriendCloudStorage({
+    keyList: [RANK_KEY],
+    success: function (res) {
+      finish();
+      loading = false;
+      var data = res.data || [];
+      var list = data.map(function (user) {
+        var score = 0;
+        var kvList = user.KVDataList || user.kvDataList || user.data || [];
+        for (var j = 0; j < kvList.length; j++) {
+          if ((kvList[j].key || kvList[j].keyName) === RANK_KEY) {
+            score = parseInt(kvList[j].value || kvList[j].valueStr || '0', 10) || 0;
+            break;
+          }
+        }
+        return { score: score };
+      });
+      list.sort(function (a, b) { return (b.score || 0) - (a.score || 0); });
+      var rank = 1;
+      var gapAbove = null;
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].score > myScore) {
+          rank++;
+          if (gapAbove == null) gapAbove = list[i].score;
+        }
+      }
+      if (gapAbove != null) gapAbove = gapAbove - myScore;
+      drawMinipanel(rank, gapAbove);
+    },
+    fail: function () {
+      finish();
+      loading = false;
+      drawMinipanel('nocontext', null);
+    }
+  });
+}
+
 wx.onMessage(function (msg) {
   if (msg.type === 'refresh') {
     fetchAndDraw();
+  } else if (msg.type === 'minipanel' && msg.score != null) {
+    fetchAndDrawMinipanel(Number(msg.score));
   }
 });

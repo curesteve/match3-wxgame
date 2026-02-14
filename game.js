@@ -16,6 +16,15 @@ const HUD_TOP_MARGIN = 98; // 顶部预留给 HUD，避免与棋盘重叠
 const COLORS = ['#ff4757', '#1e90ff', '#2ed573', '#ffd93d', '#a55eea'];
 var COLOR_NAMES = ['红', '蓝', '绿', '黄', '紫'];
 
+// 卡通风格字体：优先使用加载的自定义字体，否则用系统圆体兜底
+var FONT_FAMILY = '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", sans-serif';
+
+// 微信 8.0.69+ 兼容：用最简单方格绘制棋盘（仅 fillRect/strokeRect，无渐变/roundRect/quadraticCurveTo）
+var USE_SIMPLE_GRID = (typeof wx !== 'undefined');
+
+// 宝石图片：images/gem_0.png ~ gem_4.png，按颜色索引；未加载则用色块
+var GEM_IMAGES = [];
+
 // 动画时长（秒）
 const DUR_SWAP = 0.15;
 const DUR_ELIMINATE = 0.28;
@@ -308,6 +317,112 @@ function initCanvas() {
     canvas.height = h;
   }
   updateLayout();
+}
+
+/** 加载 images/gem_0.png ~ gem_4.png，每张对应一种颜色。微信小游戏用 readFile+base64 避免相对路径不被支持。 */
+function loadGemImages() {
+  // #region agent log
+  if (typeof fetch !== 'undefined') fetch('http://127.0.0.1:7242/ingest/2524f397-eb4f-4366-9b68-b1bdd07644f5',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'game.js:loadGemImages',message:'enter',data:{USE_SIMPLE_GRID:USE_SIMPLE_GRID,len:GEM_IMAGES.length,hypothesisId:'H1'},timestamp:Date.now()})}).catch(function(){});
+  // #endregion
+  if (!USE_SIMPLE_GRID || GEM_IMAGES.length > 0) return;
+  for (var i = 0; i < GEM_TYPES; i++) {
+    GEM_IMAGES[i] = null;
+  }
+  var useFs = typeof wx !== 'undefined' && wx.getFileSystemManager;
+  if (useFs) {
+    var fs = wx.getFileSystemManager();
+    var readFilePaths = ['images/gem_', '/images/gem_', 'gem_'];
+    for (var i = 0; i < GEM_TYPES; i++) {
+      (function (idx) {
+        function applyBase64ToImage(base64Data) {
+          var img = (canvas && canvas.createImage) ? canvas.createImage() : wx.createImage();
+          if (img.onload !== undefined) img.onload = function () { GEM_IMAGES[idx] = img; };
+          if (img.onLoad !== undefined) img.onLoad = function () { GEM_IMAGES[idx] = img; };
+          img.onerror = function () { GEM_IMAGES[idx] = null; };
+          var userPath = typeof wx !== 'undefined' && wx.env && wx.env.USER_DATA_PATH ? wx.env.USER_DATA_PATH : '';
+          if (userPath) {
+            var destPath = userPath + '/gem_' + idx + '.png';
+            fs.writeFile({
+              filePath: destPath,
+              data: base64Data,
+              encoding: 'base64',
+              success: function () { img.src = destPath; },
+              fail: function () { GEM_IMAGES[idx] = null; }
+            });
+          } else {
+            img.src = 'data:image/png;base64,' + base64Data;
+          }
+        }
+        var syncBase64 = null;
+        try {
+          for (var si = 0; si < readFilePaths.length; si++) {
+            try {
+              syncBase64 = fs.readFileSync(readFilePaths[si] + idx + '.png', 'base64');
+              if (syncBase64) break;
+            } catch (e) {}
+          }
+        } catch (e) {}
+        if (syncBase64) {
+          applyBase64ToImage(syncBase64);
+          return;
+        }
+        function tryReadFile(pathIndex) {
+          if (pathIndex >= readFilePaths.length) {
+            tryDirectCodePackageLoad(idx);
+            return;
+          }
+          var path = readFilePaths[pathIndex] + idx + '.png';
+          fs.readFile({
+            filePath: path,
+            encoding: 'base64',
+            success: function (res) {
+              // #region agent log
+              if (typeof fetch !== 'undefined') fetch('http://127.0.0.1:7242/ingest/2524f397-eb4f-4366-9b68-b1bdd07644f5',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'game.js:loadGemImages:readFile:success',message:'readFile ok',data:{idx:idx,path:path,dataLen:res&&res.data?String(res.data).length:0,hypothesisId:'H2'},timestamp:Date.now()})}).catch(function(){});
+              // #endregion
+              if (res && res.data) applyBase64ToImage(res.data);
+            },
+            fail: function (err) {
+              // #region agent log
+              if (typeof fetch !== 'undefined') fetch('http://127.0.0.1:7242/ingest/2524f397-eb4f-4366-9b68-b1bdd07644f5',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'game.js:loadGemImages:readFile:fail',message:'readFile fail',data:{idx:idx,path:path,errMsg:err&&err.errMsg?err.errMsg:String(err),pathIndex:pathIndex,hypothesisId:'H2'},timestamp:Date.now()})}).catch(function(){});
+              // #endregion
+              tryReadFile(pathIndex + 1);
+            }
+          });
+        }
+        function tryDirectCodePackageLoad(idx) {
+          var img = (canvas && canvas.createImage) ? canvas.createImage() : wx.createImage();
+          img.onerror = function () { GEM_IMAGES[idx] = null; };
+          if (img.onload !== undefined) img.onload = function () { GEM_IMAGES[idx] = img; };
+          if (img.onLoad !== undefined) img.onLoad = function () { GEM_IMAGES[idx] = img; };
+          img.src = 'images/gem_' + idx + '.png';
+        }
+        tryReadFile(0);
+      })(i);
+    }
+    return;
+  }
+  var paths = ['images/gem_', './images/gem_'];
+  for (var i = 0; i < GEM_TYPES; i++) {
+    (function (idx) {
+      function doLoad(pathIndex) {
+        if (pathIndex >= paths.length) {
+          if (typeof fetch !== 'undefined') fetch('http://127.0.0.1:7242/ingest/2524f397-eb4f-4366-9b68-b1bdd07644f5',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'game.js:loadGemImages:onerror',message:'all paths failed',data:{idx:idx,hypothesisId:'H3'},timestamp:Date.now()})}).catch(function(){});
+          return;
+        }
+        try {
+          var img = (canvas && canvas.createImage) ? canvas.createImage() : (typeof wx !== 'undefined' && wx.createImage ? wx.createImage() : new Image());
+          var onDone = function () { GEM_IMAGES[idx] = img; };
+          img.onerror = function () { doLoad(pathIndex + 1); };
+          if (img.onload !== undefined) img.onload = onDone;
+          if (img.onLoad !== undefined) img.onLoad = onDone;
+          img.src = paths[pathIndex] + idx + '.png';
+        } catch (e) {
+          doLoad(pathIndex + 1);
+        }
+      }
+      doLoad(0);
+    })(i);
+  }
 }
 
 function initGrid() {
@@ -1097,7 +1212,67 @@ function drawCandyGem(x, y, size, colorIndex, scale, opacity, scaleX, scaleY) {
   ctx.restore();
 }
 
+/** 卡通风格方格：明快色块 + 深色描边 + 高光块，仅 fillRect/strokeRect，兼容微信 8.0.69+ */
+function drawSimpleGem(x, y, size, colorIndex, scale, opacity) {
+  if (scale <= 0 || opacity <= 0) return;
+  var base = COLORS[colorIndex] || '#888';
+  var dark = shadeColor(base, -0.2);
+  var light = shadeColor(base, 0.35);
+  ctx.save();
+  ctx.globalAlpha = opacity;
+  ctx.fillStyle = base;
+  ctx.fillRect(x, y, size, size);
+  ctx.strokeStyle = dark;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x + 1, y + 1, size - 2, size - 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.fillRect(x + 2, y + 2, Math.max(2, size * 0.38), Math.max(2, size * 0.32));
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.fillRect(x + size * 0.52, y + size * 0.48, Math.max(1, size * 0.18), Math.max(1, size * 0.14));
+  ctx.strokeStyle = light;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x, y, size, size);
+  ctx.restore();
+}
+
+/** 使用 images/gem_N.png 绘制宝石；未加载或失败时回退为 drawSimpleGem */
+var _drawGemImageLogTick = 0;
+function drawGemImage(x, y, size, colorIndex, scale, opacity) {
+  if (scale <= 0 || opacity <= 0) return;
+  var img = GEM_IMAGES[colorIndex];
+  var ready = img && (img.width > 0 || img.naturalWidth > 0 || img.complete);
+  if (typeof wx !== 'undefined' && img && !ready) ready = true;
+  // #region agent log
+  _drawGemImageLogTick++;
+  if (typeof fetch !== 'undefined' && (_drawGemImageLogTick <= 5 || _drawGemImageLogTick % 90 === 0)) {
+    fetch('http://127.0.0.1:7242/ingest/2524f397-eb4f-4366-9b68-b1bdd07644f5',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'game.js:drawGemImage',message:'draw branch',data:{colorIndex:colorIndex,hasImg:!!img,w:img?img.width:0,nw:img?img.naturalWidth:0,complete:img?img.complete:0,ready:ready,hypothesisId:'H4'},timestamp:Date.now()})}).catch(function(){});
+  }
+  // #endregion
+  if (ready) {
+    try {
+      ctx.save();
+      ctx.globalAlpha = opacity;
+      if (scale !== 1) {
+        var s = size * scale;
+        var ox = (size - s) * 0.5;
+        ctx.drawImage(img, x + ox, y + ox, s, s);
+      } else {
+        ctx.drawImage(img, x, y, size, size);
+      }
+      ctx.restore();
+    } catch (e) {
+      drawSimpleGem(x, y, size, colorIndex, scale, opacity);
+    }
+  } else {
+    drawSimpleGem(x, y, size, colorIndex, scale, opacity);
+  }
+}
+
 function drawBubbleGem(x, y, size, colorIndex, scale, opacity, scaleX, scaleY) {
+  if (USE_SIMPLE_GRID) {
+    drawGemImage(x, y, size, colorIndex, scale, opacity);
+    return;
+  }
   if (typeof wx !== 'undefined') {
     drawCandyGemWx(x, y, size, colorIndex, scale, opacity, scaleX, scaleY);
     return;
@@ -1160,8 +1335,55 @@ function drawCandyGemWx(x, y, size, colorIndex, scale, opacity, scaleX, scaleY) 
   ctx.restore();
 }
 
+/** 特殊块卡通绘制：明快底色 + 粗描边 + 高光，仅 fillRect/strokeRect，兼容微信 8.0.69+ */
+function drawSimpleSpecialBlock(x, y, size, specialType) {
+  var half = size / 2;
+  var cx = x + half;
+  var cy = y + half;
+  ctx.save();
+  if (specialType === LINE_H || specialType === LINE_V) {
+    ctx.fillStyle = '#fffef5';
+    ctx.fillRect(x, y, size, size);
+    ctx.strokeStyle = '#e6b800';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x + 1, y + 1, size - 2, size - 2);
+    ctx.fillStyle = '#ffd93d';
+    if (specialType === LINE_H) {
+      ctx.fillRect(x + 2, cy - 4, size - 4, 8);
+    } else {
+      ctx.fillRect(cx - 4, y + 2, 8, size - 4);
+    }
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillRect(x + 2, y + 2, size * 0.35, size * 0.28);
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x, y, size, size);
+  } else if (specialType === BOMB) {
+    ctx.fillStyle = '#ff9800';
+    ctx.fillRect(x, y, size, size);
+    ctx.strokeStyle = '#c66900';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x + 1, y + 1, size - 2, size - 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.fillRect(x + 2, y + 2, size * 0.35, size * 0.3);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold ' + (half * 1.2) + 'px ' + FONT_FAMILY;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('★', cx, cy);
+    ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x, y, size, size);
+  }
+  ctx.restore();
+}
+
 /** 特殊块绘制：直线消除器（横/竖条纹）、炸弹（圆形+星） */
 function drawSpecialBlock(x, y, size, specialType) {
+  if (USE_SIMPLE_GRID) {
+    drawSimpleSpecialBlock(x, y, size, specialType);
+    return;
+  }
   var half = size / 2;
   var cx = x + half;
   var cy = y + half;
@@ -1193,7 +1415,7 @@ function drawSpecialBlock(x, y, size, specialType) {
     ctx.lineWidth = 2;
     ctx.stroke();
     ctx.fillStyle = '#fff';
-    ctx.font = 'bold ' + (half * 1.2) + 'px sans-serif';
+    ctx.font = 'bold ' + (half * 1.2) + 'px ' + FONT_FAMILY;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText('★', cx, cy);
@@ -1303,7 +1525,7 @@ function renderMap() {
   ctx.fillStyle = '#16213e';
   ctx.fillRect(0, 0, w, h);
   ctx.fillStyle = '#eee';
-  ctx.font = '18px sans-serif';
+  ctx.font = '18px ' + FONT_FAMILY;
   ctx.textAlign = 'center';
   var maxUnlocked = saveData ? saveData.maxUnlockedLevel : 1;
   var pageStart = levelMapPage * LEVELS_PER_PAGE + 1;
@@ -1322,10 +1544,10 @@ function renderMap() {
       ctx.lineWidth = 2;
       ctx.strokeRect(x, y, boxW, boxH);
       ctx.fillStyle = '#fff';
-      ctx.font = '14px sans-serif';
+      ctx.font = '14px ' + FONT_FAMILY;
       ctx.fillText('' + levelId, x + boxW / 2, y + boxH / 2 - 6);
       var stars = saveData && saveData.stars[levelId] != null ? saveData.stars[levelId] : 0;
-      ctx.font = '11px sans-serif';
+      ctx.font = '11px ' + FONT_FAMILY;
       ctx.fillText('★'.repeat(stars) + '☆'.repeat(3 - stars), x + boxW / 2, y + boxH / 2 + 8);
       if (locked) {
         ctx.fillStyle = 'rgba(0,0,0,0.5)';
@@ -1344,7 +1566,7 @@ function renderMap() {
   ctx.lineWidth = 1;
   ctx.strokeRect(prevX, barY + 6, btnW, btnH);
   ctx.fillStyle = '#fff';
-  ctx.font = '14px sans-serif';
+  ctx.font = '14px ' + FONT_FAMILY;
   ctx.fillText('上一页', prevX + btnW / 2, barY + 6 + btnH / 2 + 4);
   btnMapPrevRect = levelMapPage > 0 ? { x: prevX, y: barY + 6, w: btnW, h: btnH } : null;
   ctx.fillStyle = '#4a7c59';
@@ -1361,7 +1583,7 @@ function renderMap() {
   ctx.strokeStyle = '#eee';
   ctx.strokeRect(rankBtnX, rankBtnY, rankBtnW, rankBtnH);
   ctx.fillStyle = '#fff';
-  ctx.font = '15px sans-serif';
+  ctx.font = '15px ' + FONT_FAMILY;
   ctx.fillText('排行榜', contentX + contentWidth / 2, rankBtnY + rankBtnH / 2 + 5);
   btnRankRect = { x: rankBtnX, y: rankBtnY, w: rankBtnW, h: rankBtnH };
 }
@@ -1405,7 +1627,7 @@ function renderRank() {
   ctx.fillStyle = '#5c5c8a';
   ctx.fillRect(closeX, closeY, closeW, closeH);
   ctx.fillStyle = '#fff';
-  ctx.font = '16px sans-serif';
+  ctx.font = '16px ' + FONT_FAMILY;
   ctx.textAlign = 'center';
   ctx.fillText('关闭', contentX + contentWidth / 2, closeY + closeH / 2 + 6);
   btnRankCloseRect = { x: closeX, y: closeY, w: closeW, h: closeH };
@@ -1441,7 +1663,7 @@ function render() {
   var hudY = contentY + 14;
   var lineH = 16;
   ctx.fillStyle = '#eee';
-  ctx.font = '13px sans-serif';
+  ctx.font = '13px ' + FONT_FAMILY;
   ctx.textAlign = 'left';
   ctx.fillText('步数: ' + movesLeft, offsetX, hudY);
   for (var i = 0; i < currentGoals.length; i++) {
@@ -1459,6 +1681,22 @@ function render() {
   }
   ctx.fillStyle = '#eee';
   var potentialTotal = getPotentialTotalScoreForRank();
+  var rankPanelX = contentX + contentWidth - MINIPANEL_W - 10;
+  var rankPanelY = contentY + 8;
+  if (gameScene === 'play') {
+    ctx.fillStyle = 'rgba(22,33,62,0.92)';
+    ctx.fillRect(rankPanelX, rankPanelY, MINIPANEL_W, MINIPANEL_H);
+    ctx.strokeStyle = '#4a7c9e';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(rankPanelX, rankPanelY, MINIPANEL_W, MINIPANEL_H);
+    ctx.fillStyle = '#fff';
+    ctx.font = '14px ' + FONT_FAMILY;
+    ctx.textAlign = 'left';
+    ctx.fillText('好友排名', rankPanelX + 10, rankPanelY + 20);
+    ctx.font = '12px ' + FONT_FAMILY;
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.fillText('加载中，真机显示排名', rankPanelX + 10, rankPanelY + 40);
+  }
   try {
     var openCtx = wx.getOpenDataContext && wx.getOpenDataContext();
     if (gameScene === 'play' && openCtx && openCtx.canvas) {
@@ -1468,11 +1706,11 @@ function render() {
         openCtx.postMessage({ type: 'minipanel', score: Math.floor(potentialTotal) });
       }
       updateRankMinipanel(potentialTotal);
-      ctx.drawImage(openCtx.canvas, 0, 0, MINIPANEL_W, MINIPANEL_H, contentX + contentWidth - MINIPANEL_W - 10, contentY + 8, MINIPANEL_W, MINIPANEL_H);
+      ctx.drawImage(openCtx.canvas, 0, 0, MINIPANEL_W, MINIPANEL_H, rankPanelX, rankPanelY, MINIPANEL_W, MINIPANEL_H);
     } else {
       updateRankMinipanel(potentialTotal);
       if (openCtx && openCtx.canvas && openCtx.canvas.width === MINIPANEL_W) {
-        ctx.drawImage(openCtx.canvas, 0, 0, MINIPANEL_W, MINIPANEL_H, contentX + contentWidth - MINIPANEL_W - 10, contentY + 8, MINIPANEL_W, MINIPANEL_H);
+        ctx.drawImage(openCtx.canvas, 0, 0, MINIPANEL_W, MINIPANEL_H, rankPanelX, rankPanelY, MINIPANEL_W, MINIPANEL_H);
       }
     }
   } catch (e) {}
@@ -1674,7 +1912,7 @@ function render() {
     ctx.shadowBlur = 12;
     ctx.shadowColor = '#f1c40f';
     ctx.fillStyle = '#fff';
-    ctx.font = 'bold ' + (20 + comboScale * 8) + 'px sans-serif';
+    ctx.font = 'bold ' + (20 + comboScale * 8) + 'px ' + FONT_FAMILY;
     ctx.textAlign = 'center';
     ctx.fillText(comboText.text, w / 2, offsetY - 25);
     ctx.shadowBlur = 0;
@@ -1750,13 +1988,13 @@ function render() {
       const y = offsetY + r * cellSize;
       const key = r + ',' + c;
       if (isWall(r, c)) {
-        ctx.fillStyle = '#3d3d5c';
+        ctx.fillStyle = USE_SIMPLE_GRID ? '#4a4a6a' : '#3d3d5c';
         ctx.fillRect(x + 2, y + 2, cellSize - 4, cellSize - 4);
-        ctx.strokeStyle = '#5c5c8a';
-        ctx.lineWidth = 1;
+        ctx.strokeStyle = USE_SIMPLE_GRID ? '#6a6a9a' : '#5c5c8a';
+        ctx.lineWidth = USE_SIMPLE_GRID ? 2 : 1;
         ctx.strokeRect(x + 2, y + 2, cellSize - 4, cellSize - 4);
       } else if (grid[r][c] < 0 && (!fillSet || !fillSet.has(key)) && (!dropTargetSet || !dropTargetSet.has(key))) {
-        ctx.fillStyle = (iceGrid[r] && iceGrid[r][c] > 0) ? 'rgba(200,230,255,0.4)' : 'rgba(255,255,255,0.08)';
+        ctx.fillStyle = (iceGrid[r] && iceGrid[r][c] > 0) ? 'rgba(200,230,255,0.45)' : (USE_SIMPLE_GRID ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.08)');
         ctx.fillRect(x, y, cellSize, cellSize);
       }
     }
@@ -1775,11 +2013,11 @@ function render() {
     ctx.lineWidth = 2;
     ctx.strokeRect(panelX, panelY, panelW, panelH);
     ctx.fillStyle = '#eee';
-    ctx.font = '18px sans-serif';
+    ctx.font = '18px ' + FONT_FAMILY;
     ctx.textAlign = 'center';
     ctx.fillText(overlay === 'win' ? '胜利！' : '步数用尽', contentX + contentWidth / 2, panelY + 32);
     if (overlay === 'win' && lastEarnedStars >= 1) {
-      ctx.font = '16px sans-serif';
+      ctx.font = '16px ' + FONT_FAMILY;
       ctx.fillText('获得 ' + '★'.repeat(lastEarnedStars) + '☆'.repeat(3 - lastEarnedStars) + ' 星', contentX + contentWidth / 2, panelY + 50);
     }
     var btnW = 100;
@@ -1799,7 +2037,7 @@ function render() {
     ctx.fillStyle = '#4a7c59';
     ctx.fillRect(btnX, btnY, btnW, btnH);
     ctx.fillStyle = '#fff';
-    ctx.font = '16px sans-serif';
+    ctx.font = '16px ' + FONT_FAMILY;
     ctx.fillText(overlay === 'win' ? '下一关' : '重试', contentX + contentWidth / 2, btnY + 24);
     var btnMapY = overlay === 'win' ? panelY + 168 : panelY + 92;
     ctx.fillStyle = '#5c5c8a';
@@ -1819,6 +2057,22 @@ function render() {
     btnRetryRect = null;
     btnMapRect = null;
   }
+  // 对局中且无结算遮罩时，在最后一笔再绘一次排名面板，保证始终在最上层且使用最新 sharedCanvas
+  if (gameScene === 'play' && overlay !== 'win' && overlay !== 'fail') {
+    try {
+      var openCtxLast = wx.getOpenDataContext && wx.getOpenDataContext();
+      if (openCtxLast && openCtxLast.canvas) {
+        if (openCtxLast.canvas.width !== MINIPANEL_W || openCtxLast.canvas.height !== MINIPANEL_H) {
+          openCtxLast.canvas.width = MINIPANEL_W;
+          openCtxLast.canvas.height = MINIPANEL_H;
+          openCtxLast.postMessage({ type: 'minipanel', score: Math.floor(getPotentialTotalScoreForRank()) });
+        }
+        if (openCtxLast.canvas.width === MINIPANEL_W) {
+          ctx.drawImage(openCtxLast.canvas, 0, 0, MINIPANEL_W, MINIPANEL_H, rankPanelX, rankPanelY, MINIPANEL_W, MINIPANEL_H);
+        }
+      }
+    } catch (e) {}
+  }
   if (screenShakeFrames > 0) ctx.restore();
 }
 
@@ -1830,6 +2084,13 @@ function bindTouch() {
 
 function main() {
   initCanvas();
+  loadGemImages();
+  if (typeof wx !== 'undefined' && wx.loadFont) {
+    try {
+      var loaded = wx.loadFont('fonts/cartoon.ttf') || wx.loadFont('fonts/ZCOOLKuaiLe-Regular.ttf');
+      if (loaded && typeof loaded === 'string') FONT_FAMILY = loaded;
+    } catch (e) {}
+  }
   bindTouch();
   saveData = loadSave();
   gameScene = 'map';
