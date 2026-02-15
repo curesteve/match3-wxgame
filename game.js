@@ -11,6 +11,8 @@ const LINE_H = 6; // 横向直线消除
 const LINE_V = 7; // 纵向直线消除
 const BOMB = 8;   // 3×3 爆炸
 const HUD_TOP_MARGIN = 98; // 顶部预留给 HUD，避免与棋盘重叠
+const HUD_SAFE_TOP_EXTRA = 36;   // HUD 相对安全区顶部的额外下移，避免遮挡状态栏/刘海
+const RANK_PANEL_RIGHT_MARGIN = 28; // 排名面板距右边缘，避免遮挡小程序胶囊按钮
 
 // 糖果风：鲜艳且蓝绿区分明显（红、蓝、绿、黄、紫）
 const COLORS = ['#ff4757', '#1e90ff', '#2ed573', '#ffd93d', '#a55eea'];
@@ -24,7 +26,8 @@ var USE_SIMPLE_GRID = (typeof wx !== 'undefined');
 
 // 宝石图片：images/gem_0.png ~ gem_4.png，按颜色索引；未加载则用色块
 var GEM_IMAGES = [];
-
+/** 可选：真机代码包/路径失败时，从该 URL 前缀下载 gem_0.png～gem_4.png，如 'https://xxx.com/gems/'（需配置合法域名） */
+var GEM_IMAGES_BASE_URL = '';
 // 动画时长（秒）
 const DUR_SWAP = 0.15;
 const DUR_ELIMINATE = 0.28;
@@ -46,6 +49,7 @@ var contentWidth = 0;
 var contentHeight = 0;
 var contentX = 0;
 var contentY = 0;
+var bgImage = null; // 背景图 images/bg.png，可选
 
 // 触摸：滑动交换（起点格子 + 起点像素，用于方向推断）
 let touchStartCell = null; // { row, col }
@@ -80,7 +84,7 @@ function generateLevelConfig(levelId) {
 // 阶段五：存档 key 与默认结构
 var SAVE_KEY = 'game_save';
 function getDefaultSave() {
-  return { version: 1, maxUnlockedLevel: 1, stars: {}, bestScorePerLevel: {} };
+  return { version: 1, maxUnlockedLevel: 1, stars: {}, bestScorePerLevel: {}, gameRecords: [] };
 }
 function loadSave() {
   try {
@@ -89,6 +93,7 @@ function loadSave() {
     var data = JSON.parse(raw);
     if (!data.stars || typeof data.stars !== 'object') data.stars = {};
     if (!data.bestScorePerLevel || typeof data.bestScorePerLevel !== 'object') data.bestScorePerLevel = {};
+    if (!Array.isArray(data.gameRecords)) data.gameRecords = [];
     if (typeof data.maxUnlockedLevel !== 'number') data.maxUnlockedLevel = 1;
     if (!data.version) data.version = 1;
     return data;
@@ -120,7 +125,9 @@ function getPotentialTotalScoreForRank() {
 var RANK_KEY = 'score';
 var MINIPANEL_W = 200;
 var MINIPANEL_H = 52;
+var RANK_PANEL_EXTRA = 22; // 排名面板下方显示总得分的高度
 var lastMinipanelScoreSent = -1;
+var lastShareImagePath = ''; // 最近一次截图路径，供分享到聊天/朋友圈使用
 function updateRankMinipanel(scoreForRank) {
   if (scoreForRank == null || scoreForRank < 0) return;
   var s = Math.floor(scoreForRank);
@@ -143,6 +150,52 @@ function submitScoreForRank(scoreForRank) {
       KVDataList: [{ key: RANK_KEY, value: String(Math.max(0, Math.floor(scoreForRank))) }]
     });
   } catch (e) {}
+}
+
+/** 将当前画布导出为截图，然后弹出「分享给好友」/「分享到朋友圈」选择，直接进入对应分享流程 */
+function doShareScreenshot() {
+  if (typeof wx === 'undefined' || !wx.canvasToTempFilePath) return;
+  try {
+    var w = canvas.width || 375;
+    var h = canvas.height || 375;
+    wx.canvasToTempFilePath({
+      canvas: canvas,
+      x: 0,
+      y: 0,
+      width: w,
+      height: h,
+      destWidth: w,
+      destHeight: h,
+      fileType: 'png',
+      success: function (res) {
+        lastShareImagePath = res.tempFilePath;
+        wx.showActionSheet({
+          itemList: ['分享给好友', '分享到朋友圈'],
+          success: function (actionRes) {
+            if (actionRes.tapIndex === 0) {
+              wx.shareAppMessage({ title: '三消乐园', imageUrl: lastShareImagePath });
+            } else if (actionRes.tapIndex === 1) {
+              if (wx.showModal) {
+                wx.showModal({
+                  title: '分享到朋友圈',
+                  content: '请点击屏幕右上角「···」菜单，选择「分享到朋友圈」即可分享当前截图。',
+                  showCancel: false,
+                  confirmText: '知道了'
+                });
+              } else if (wx.showToast) {
+                wx.showToast({ title: '请点击右上角···选择「分享到朋友圈」', icon: 'none', duration: 2500 });
+              }
+            }
+          }
+        });
+      },
+      fail: function () {
+        if (wx.showToast) wx.showToast({ title: '截图失败', icon: 'none' });
+      }
+    });
+  } catch (e) {
+    if (wx.showToast) wx.showToast({ title: '分享失败', icon: 'none' });
+  }
 }
 var saveData = null; // 启动时由 main() 赋值为 loadSave()
 
@@ -190,8 +243,14 @@ var currentGoals = []; // 当前关 goals，来自 getLevelConfig
 var goalProgress = {}; // collect_0..collect_4 收集数量
 var overlay = null; // null | 'win' | 'fail'
 var lastEarnedStars = 0; // 本局过关获得的星级 1～3，供胜利面板与存档用
-var gameScene = 'map'; // 'map' | 'play' | 'rank'，关卡选择 / 对局 / 排行榜
+var gameScene = 'start'; // 'start' | 'play' | 'rank'，开局选择 / 对局 / 排行榜（已取消关卡选择界面）
 var comboIndex = 0; // 连消序号，用于计分加成
+var levelStartTime = 0; // 本关开始时间戳，用于通关时间与时间加分
+var initialMovesForLevel = 20; // 本关总步数，用于记录使用步数
+var elim3Count = 0;
+var elim4Count = 0;
+var elim5Count = 0;
+var elim6PlusCount = 0; // 本局 3/4/5/6+ 消次数，供对局记录与后台调阅
 var wallGrid = []; // wallGrid[r][c] === true 表示墙
 var iceGrid = []; // iceGrid[r][c] 为冰块血量，0 表示无
 
@@ -292,12 +351,24 @@ function updateLayout() {
     }
   }
   updateSafeAreaInsets(w, h);
-  var playH = contentHeight - HUD_TOP_MARGIN;
+  var hudTop = HUD_TOP_MARGIN + (safeInsetTop > 20 ? HUD_SAFE_TOP_EXTRA : 0);
+  var playH = contentHeight - hudTop - (safeInsetBottom > 0 ? Math.min(safeInsetBottom, 40) : 0);
   if (playH <= 0) playH = contentHeight * 0.7;
   cellSize = Math.min(contentWidth, playH) / 8;
   if (cellSize <= 0) cellSize = Math.min(contentWidth, contentHeight) / 8;
   offsetX = contentX + (contentWidth - cellSize * COLS) / 2;
-  offsetY = contentY + HUD_TOP_MARGIN + (playH - cellSize * ROWS) / 2;
+  offsetY = contentY + hudTop + (playH - cellSize * ROWS) / 2;
+}
+
+function loadBackgroundImage() {
+  if (bgImage && bgImage.width) return;
+  try {
+    var img = (typeof wx !== 'undefined' && wx.createImage) ? wx.createImage() : (typeof Image !== 'undefined' ? new Image() : null);
+    if (!img) return;
+    img.onload = function () { bgImage = img; };
+    img.onerror = function () {};
+    img.src = 'images/bg.png';
+  } catch (e) {}
 }
 
 function initCanvas() {
@@ -319,109 +390,48 @@ function initCanvas() {
   updateLayout();
 }
 
-/** 加载 images/gem_0.png ~ gem_4.png，每张对应一种颜色。微信小游戏用 readFile+base64 避免相对路径不被支持。 */
+/** 加载 images/gem_0.png ~ gem_4.png，与背景图相同方式：createImage + src 直接路径，不经过 readFile/writeFile */
 function loadGemImages() {
-  // #region agent log
-  if (typeof fetch !== 'undefined') fetch('http://127.0.0.1:7242/ingest/2524f397-eb4f-4366-9b68-b1bdd07644f5',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'game.js:loadGemImages',message:'enter',data:{USE_SIMPLE_GRID:USE_SIMPLE_GRID,len:GEM_IMAGES.length,hypothesisId:'H1'},timestamp:Date.now()})}).catch(function(){});
-  // #endregion
   if (!USE_SIMPLE_GRID || GEM_IMAGES.length > 0) return;
   for (var i = 0; i < GEM_TYPES; i++) {
     GEM_IMAGES[i] = null;
   }
-  var useFs = typeof wx !== 'undefined' && wx.getFileSystemManager;
-  if (useFs) {
-    var fs = wx.getFileSystemManager();
-    var readFilePaths = ['images/gem_', '/images/gem_', 'gem_'];
-    for (var i = 0; i < GEM_TYPES; i++) {
-      (function (idx) {
-        function applyBase64ToImage(base64Data) {
-          var img = (canvas && canvas.createImage) ? canvas.createImage() : wx.createImage();
-          if (img.onload !== undefined) img.onload = function () { GEM_IMAGES[idx] = img; };
-          if (img.onLoad !== undefined) img.onLoad = function () { GEM_IMAGES[idx] = img; };
-          img.onerror = function () { GEM_IMAGES[idx] = null; };
-          var userPath = typeof wx !== 'undefined' && wx.env && wx.env.USER_DATA_PATH ? wx.env.USER_DATA_PATH : '';
-          if (userPath) {
-            var destPath = userPath + '/gem_' + idx + '.png';
-            fs.writeFile({
-              filePath: destPath,
-              data: base64Data,
-              encoding: 'base64',
-              success: function () { img.src = destPath; },
-              fail: function () { GEM_IMAGES[idx] = null; }
-            });
-          } else {
-            img.src = 'data:image/png;base64,' + base64Data;
-          }
-        }
-        var syncBase64 = null;
-        try {
-          for (var si = 0; si < readFilePaths.length; si++) {
-            try {
-              syncBase64 = fs.readFileSync(readFilePaths[si] + idx + '.png', 'base64');
-              if (syncBase64) break;
-            } catch (e) {}
-          }
-        } catch (e) {}
-        if (syncBase64) {
-          applyBase64ToImage(syncBase64);
-          return;
-        }
-        function tryReadFile(pathIndex) {
-          if (pathIndex >= readFilePaths.length) {
-            tryDirectCodePackageLoad(idx);
-            return;
-          }
-          var path = readFilePaths[pathIndex] + idx + '.png';
-          fs.readFile({
-            filePath: path,
-            encoding: 'base64',
-            success: function (res) {
-              // #region agent log
-              if (typeof fetch !== 'undefined') fetch('http://127.0.0.1:7242/ingest/2524f397-eb4f-4366-9b68-b1bdd07644f5',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'game.js:loadGemImages:readFile:success',message:'readFile ok',data:{idx:idx,path:path,dataLen:res&&res.data?String(res.data).length:0,hypothesisId:'H2'},timestamp:Date.now()})}).catch(function(){});
-              // #endregion
-              if (res && res.data) applyBase64ToImage(res.data);
-            },
-            fail: function (err) {
-              // #region agent log
-              if (typeof fetch !== 'undefined') fetch('http://127.0.0.1:7242/ingest/2524f397-eb4f-4366-9b68-b1bdd07644f5',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'game.js:loadGemImages:readFile:fail',message:'readFile fail',data:{idx:idx,path:path,errMsg:err&&err.errMsg?err.errMsg:String(err),pathIndex:pathIndex,hypothesisId:'H2'},timestamp:Date.now()})}).catch(function(){});
-              // #endregion
-              tryReadFile(pathIndex + 1);
-            }
-          });
-        }
-        function tryDirectCodePackageLoad(idx) {
-          var img = (canvas && canvas.createImage) ? canvas.createImage() : wx.createImage();
-          img.onerror = function () { GEM_IMAGES[idx] = null; };
-          if (img.onload !== undefined) img.onload = function () { GEM_IMAGES[idx] = img; };
-          if (img.onLoad !== undefined) img.onLoad = function () { GEM_IMAGES[idx] = img; };
-          img.src = 'images/gem_' + idx + '.png';
-        }
-        tryReadFile(0);
-      })(i);
-    }
-    return;
-  }
-  var paths = ['images/gem_', './images/gem_'];
+  var createImg = (typeof wx !== 'undefined' && wx.createImage) ? function () { return wx.createImage(); } : (typeof Image !== 'undefined' ? function () { return new Image(); } : null);
+  if (!createImg) return;
   for (var i = 0; i < GEM_TYPES; i++) {
     (function (idx) {
-      function doLoad(pathIndex) {
-        if (pathIndex >= paths.length) {
-          if (typeof fetch !== 'undefined') fetch('http://127.0.0.1:7242/ingest/2524f397-eb4f-4366-9b68-b1bdd07644f5',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'game.js:loadGemImages:onerror',message:'all paths failed',data:{idx:idx,hypothesisId:'H3'},timestamp:Date.now()})}).catch(function(){});
-          return;
-        }
-        try {
-          var img = (canvas && canvas.createImage) ? canvas.createImage() : (typeof wx !== 'undefined' && wx.createImage ? wx.createImage() : new Image());
-          var onDone = function () { GEM_IMAGES[idx] = img; };
-          img.onerror = function () { doLoad(pathIndex + 1); };
-          if (img.onload !== undefined) img.onload = onDone;
-          if (img.onLoad !== undefined) img.onLoad = onDone;
-          img.src = paths[pathIndex] + idx + '.png';
-        } catch (e) {
-          doLoad(pathIndex + 1);
-        }
+      try {
+        var img = createImg();
+        img.onload = function () { GEM_IMAGES[idx] = img; };
+        img.onerror = function () { GEM_IMAGES[idx] = null; };
+        if (img.onLoad !== undefined) img.onLoad = img.onload;
+        img.src = 'images/gem_' + idx + '.png';
+      } catch (e) {
+        GEM_IMAGES[idx] = null;
       }
-      doLoad(0);
     })(i);
+  }
+  if (GEM_IMAGES_BASE_URL && typeof wx !== 'undefined' && wx.downloadFile) {
+    setTimeout(function () {
+      for (var di = 0; di < GEM_TYPES; di++) {
+        if (GEM_IMAGES[di]) continue;
+        (function (idx) {
+          var url = GEM_IMAGES_BASE_URL.replace(/\/$/, '') + '/gem_' + idx + '.png';
+          wx.downloadFile({
+            url: url,
+            success: function (res) {
+              if (!res || !res.tempFilePath) return;
+              var img = createImg();
+              img.onerror = function () { GEM_IMAGES[idx] = null; };
+              img.onload = function () { GEM_IMAGES[idx] = img; };
+              if (img.onLoad !== undefined) img.onLoad = img.onload;
+              img.src = res.tempFilePath;
+            },
+            fail: function () {}
+          });
+        })(di);
+      }
+    }, 1500);
   }
 }
 
@@ -454,7 +464,13 @@ function startLevel(levelId) {
   lastMinipanelScoreSent = -1;
   currentLevelId = levelId;
   movesLeft = config.moves;
+  initialMovesForLevel = config.moves;
+  levelStartTime = typeof Date.now === 'function' ? Date.now() : 0;
   score = 0;
+  elim3Count = 0;
+  elim4Count = 0;
+  elim5Count = 0;
+  elim6PlusCount = 0;
   try {
     var openCtx = wx.getOpenDataContext && wx.getOpenDataContext();
     if (openCtx && openCtx.canvas) {
@@ -835,7 +851,7 @@ function clearTouch() {
 }
 
 function onTouchStart(e) {
-  if (gameScene === 'map' || gameScene === 'rank') return;
+  if (gameScene === 'start' || gameScene === 'rank') return;
   if (state !== 'idle') return;
   const touch = e.touches && e.touches[0];
   if (!touch) return;
@@ -852,31 +868,29 @@ function onTouchEnd(e) {
   if (!touch) return;
   const endX = touch.clientX != null ? touch.clientX : touch.x;
   const endY = touch.clientY != null ? touch.clientY : touch.y;
-  if (gameScene === 'map') {
+  if (gameScene === 'start') {
+    if (btnStartFrom1Rect && endX >= btnStartFrom1Rect.x && endX <= btnStartFrom1Rect.x + btnStartFrom1Rect.w && endY >= btnStartFrom1Rect.y && endY <= btnStartFrom1Rect.y + btnStartFrom1Rect.h) {
+      gameScene = 'play';
+      startLevel(1);
+      return;
+    }
+    if (btnStartContinueRect && endX >= btnStartContinueRect.x && endX <= btnStartContinueRect.x + btnStartContinueRect.w && endY >= btnStartContinueRect.y && endY <= btnStartContinueRect.y + btnStartContinueRect.h) {
+      gameScene = 'play';
+      var startLevelId = (saveData && saveData.maxUnlockedLevel) ? saveData.maxUnlockedLevel : 1;
+      startLevel(startLevelId);
+      return;
+    }
     if (btnRankRect && endX >= btnRankRect.x && endX <= btnRankRect.x + btnRankRect.w && endY >= btnRankRect.y && endY <= btnRankRect.y + btnRankRect.h) {
       openRankPanel();
       return;
-    }
-    if (btnMapPrevRect && endX >= btnMapPrevRect.x && endX <= btnMapPrevRect.x + btnMapPrevRect.w && endY >= btnMapPrevRect.y && endY <= btnMapPrevRect.y + btnMapPrevRect.h) {
-      if (levelMapPage > 0) { levelMapPage--; renderMap(); }
-      return;
-    }
-    if (btnMapNextRect && endX >= btnMapNextRect.x && endX <= btnMapNextRect.x + btnMapNextRect.w && endY >= btnMapNextRect.y && endY <= btnMapNextRect.y + btnMapNextRect.h) {
-      levelMapPage++; ensureLevelMapPageInRange(); renderMap();
-      return;
-    }
-    var levelId = getMapTouchLevel(endX, endY);
-    if (levelId != null && saveData && levelId <= saveData.maxUnlockedLevel) {
-      gameScene = 'play';
-      startLevel(levelId);
     }
     return;
   }
   if (gameScene === 'rank') {
     if (btnRankCloseRect && endX >= btnRankCloseRect.x && endX <= btnRankCloseRect.x + btnRankCloseRect.w && endY >= btnRankCloseRect.y && endY <= btnRankCloseRect.y + btnRankCloseRect.h) {
-      gameScene = 'map';
+      gameScene = 'start';
       btnRankCloseRect = null;
-      renderMap();
+      renderStart();
     }
     return;
   }
@@ -951,8 +965,8 @@ function handleOverlayTouch(e) {
   var y = touch.clientY != null ? touch.clientY : touch.y;
   if (btnMapRect && x >= btnMapRect.x && x <= btnMapRect.x + btnMapRect.w && y >= btnMapRect.y && y <= btnMapRect.y + btnMapRect.h) {
     overlay = null;
-    gameScene = 'map';
-    renderMap();
+    gameScene = 'start';
+    renderStart();
     return;
   }
   if (overlay === 'win' && btnNextRect && x >= btnNextRect.x && x <= btnNextRect.x + btnNextRect.w && y >= btnNextRect.y && y <= btnNextRect.y + btnNextRect.h) {
@@ -993,10 +1007,15 @@ function gameLoop(now) {
     eliminateAnim.progress += dt / DUR_ELIMINATE;
     if (eliminateAnim.progress >= 1) {
       comboIndex++;
+      var matchLen = eliminateAnim.matches.length;
+      if (matchLen === 3) elim3Count++;
+      else if (matchLen === 4) elim4Count++;
+      else if (matchLen === 5) elim5Count++;
+      else if (matchLen >= 6) elim6PlusCount++;
       var matchCells = eliminateAnim.matches.map(function (m) { return { row: m.row, col: m.col }; });
       var runs = getMatchRuns(eliminateAnim.matches);
       var specialSpawns = getSpecialSpawns(eliminateAnim.matches, runs);
-      var addScore = eliminateAnim.matches.length * 10 * comboIndex;
+      var addScore = matchLen * 10 * comboIndex;
       score += addScore;
       for (var i = 0; i < eliminateAnim.matches.length; i++) {
         var m = eliminateAnim.matches[i];
@@ -1078,6 +1097,10 @@ function gameLoop(now) {
         lastTime = 0;
         if (allGoalsMet()) {
           var config = getLevelConfig(currentLevelId);
+          var durationMs = (typeof Date.now === 'function' ? Date.now() : 0) - levelStartTime;
+          var durationSec = Math.max(0, durationMs / 1000);
+          var timeBonus = Math.max(0, Math.floor(600 - durationSec * 2));
+          score += timeBonus;
           var th = config ? getStarThresholds(config) : { star2Score: 0, star3Score: 0 };
           var stars = 1;
           if (score >= th.star3Score) stars = 3; else if (score >= th.star2Score) stars = 2;
@@ -1089,12 +1112,48 @@ function gameLoop(now) {
             saveData.stars[currentLevelId] = (cur == null ? stars : Math.max(cur, stars));
             var curBest = saveData.bestScorePerLevel[currentLevelId];
             saveData.bestScorePerLevel[currentLevelId] = (curBest == null ? score : Math.max(curBest, score));
+            if (!saveData.gameRecords) saveData.gameRecords = [];
+            saveData.gameRecords.push({
+              levelId: currentLevelId,
+              durationSec: Math.round(durationSec * 100) / 100,
+              movesUsed: initialMovesForLevel - movesLeft,
+              totalMoves: initialMovesForLevel,
+              score: score,
+              stars: stars,
+              elim3: elim3Count,
+              elim4: elim4Count,
+              elim5: elim5Count,
+              elim6Plus: elim6PlusCount,
+              win: true,
+              timestamp: typeof Date.now === 'function' ? Date.now() : 0
+            });
+            // 对局记录已写入 saveData.gameRecords，可在此处通过 wx.request 上报到后台供调阅
             saveSave(saveData);
             submitScoreForRank(getTotalScoreForRank());
           }
           overlay = 'win';
           playSound('win');
         } else if (movesLeft <= 0) {
+          if (saveData) {
+            var durationMs = (typeof Date.now === 'function' ? Date.now() : 0) - levelStartTime;
+            var durationSec = Math.max(0, durationMs / 1000);
+            if (!saveData.gameRecords) saveData.gameRecords = [];
+            saveData.gameRecords.push({
+              levelId: currentLevelId,
+              durationSec: Math.round(durationSec * 100) / 100,
+              movesUsed: initialMovesForLevel - movesLeft,
+              totalMoves: initialMovesForLevel,
+              score: score,
+              stars: 0,
+              elim3: elim3Count,
+              elim4: elim4Count,
+              elim5: elim5Count,
+              elim6Plus: elim6PlusCount,
+              win: false,
+              timestamp: typeof Date.now === 'function' ? Date.now() : 0
+            });
+            saveSave(saveData);
+          }
           overlay = 'fail';
           playSound('fail');
         }
@@ -1212,42 +1271,37 @@ function drawCandyGem(x, y, size, colorIndex, scale, opacity, scaleX, scaleY) {
   ctx.restore();
 }
 
-/** 卡通风格方格：明快色块 + 深色描边 + 高光块，仅 fillRect/strokeRect，兼容微信 8.0.69+ */
+/** 卡通风格方格：圆角色块 + 边框 + 高光块 */
 function drawSimpleGem(x, y, size, colorIndex, scale, opacity) {
   if (scale <= 0 || opacity <= 0) return;
   var base = COLORS[colorIndex] || '#888';
   var dark = shadeColor(base, -0.2);
   var light = shadeColor(base, 0.35);
+  var r = Math.max(2, Math.min(size / 5, 8));
   ctx.save();
   ctx.globalAlpha = opacity;
+  roundRectPath(ctx, x, y, size, size, r);
   ctx.fillStyle = base;
-  ctx.fillRect(x, y, size, size);
+  ctx.fill();
   ctx.strokeStyle = dark;
   ctx.lineWidth = 2;
-  ctx.strokeRect(x + 1, y + 1, size - 2, size - 2);
+  ctx.stroke();
   ctx.fillStyle = 'rgba(255,255,255,0.55)';
   ctx.fillRect(x + 2, y + 2, Math.max(2, size * 0.38), Math.max(2, size * 0.32));
   ctx.fillStyle = 'rgba(255,255,255,0.25)';
   ctx.fillRect(x + size * 0.52, y + size * 0.48, Math.max(1, size * 0.18), Math.max(1, size * 0.14));
+  roundRectPath(ctx, x, y, size, size, r);
   ctx.strokeStyle = light;
   ctx.lineWidth = 1;
-  ctx.strokeRect(x, y, size, size);
+  ctx.stroke();
   ctx.restore();
 }
 
-/** 使用 images/gem_N.png 绘制宝石；未加载或失败时回退为 drawSimpleGem */
-var _drawGemImageLogTick = 0;
+/** 使用 images/gem_N.png 绘制宝石；未加载或失败时回退为带高光的 drawSimpleGem */
 function drawGemImage(x, y, size, colorIndex, scale, opacity) {
   if (scale <= 0 || opacity <= 0) return;
   var img = GEM_IMAGES[colorIndex];
   var ready = img && (img.width > 0 || img.naturalWidth > 0 || img.complete);
-  if (typeof wx !== 'undefined' && img && !ready) ready = true;
-  // #region agent log
-  _drawGemImageLogTick++;
-  if (typeof fetch !== 'undefined' && (_drawGemImageLogTick <= 5 || _drawGemImageLogTick % 90 === 0)) {
-    fetch('http://127.0.0.1:7242/ingest/2524f397-eb4f-4366-9b68-b1bdd07644f5',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'game.js:drawGemImage',message:'draw branch',data:{colorIndex:colorIndex,hasImg:!!img,w:img?img.width:0,nw:img?img.naturalWidth:0,complete:img?img.complete:0,ready:ready,hypothesisId:'H4'},timestamp:Date.now()})}).catch(function(){});
-  }
-  // #endregion
   if (ready) {
     try {
       ctx.save();
@@ -1335,18 +1389,20 @@ function drawCandyGemWx(x, y, size, colorIndex, scale, opacity, scaleX, scaleY) 
   ctx.restore();
 }
 
-/** 特殊块卡通绘制：明快底色 + 粗描边 + 高光，仅 fillRect/strokeRect，兼容微信 8.0.69+ */
+/** 特殊块卡通绘制：圆角 + 边框 + 高光 */
 function drawSimpleSpecialBlock(x, y, size, specialType) {
   var half = size / 2;
   var cx = x + half;
   var cy = y + half;
+  var r = Math.max(2, Math.min(size / 5, 8));
   ctx.save();
   if (specialType === LINE_H || specialType === LINE_V) {
+    roundRectPath(ctx, x, y, size, size, r);
     ctx.fillStyle = '#fffef5';
-    ctx.fillRect(x, y, size, size);
+    ctx.fill();
     ctx.strokeStyle = '#e6b800';
     ctx.lineWidth = 2;
-    ctx.strokeRect(x + 1, y + 1, size - 2, size - 2);
+    ctx.stroke();
     ctx.fillStyle = '#ffd93d';
     if (specialType === LINE_H) {
       ctx.fillRect(x + 2, cy - 4, size - 4, 8);
@@ -1355,15 +1411,17 @@ function drawSimpleSpecialBlock(x, y, size, specialType) {
     }
     ctx.fillStyle = 'rgba(255,255,255,0.6)';
     ctx.fillRect(x + 2, y + 2, size * 0.35, size * 0.28);
+    roundRectPath(ctx, x, y, size, size, r);
     ctx.strokeStyle = 'rgba(255,255,255,0.9)';
     ctx.lineWidth = 1;
-    ctx.strokeRect(x, y, size, size);
+    ctx.stroke();
   } else if (specialType === BOMB) {
+    roundRectPath(ctx, x, y, size, size, r);
     ctx.fillStyle = '#ff9800';
-    ctx.fillRect(x, y, size, size);
+    ctx.fill();
     ctx.strokeStyle = '#c66900';
     ctx.lineWidth = 2;
-    ctx.strokeRect(x + 1, y + 1, size - 2, size - 2);
+    ctx.stroke();
     ctx.fillStyle = 'rgba(255,255,255,0.5)';
     ctx.fillRect(x + 2, y + 2, size * 0.35, size * 0.3);
     ctx.fillStyle = '#fff';
@@ -1371,9 +1429,10 @@ function drawSimpleSpecialBlock(x, y, size, specialType) {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText('★', cx, cy);
+    roundRectPath(ctx, x, y, size, size, r);
     ctx.strokeStyle = 'rgba(255,255,255,0.8)';
     ctx.lineWidth = 1;
-    ctx.strokeRect(x, y, size, size);
+    ctx.stroke();
   }
   ctx.restore();
 }
@@ -1429,6 +1488,26 @@ function shadeColor(hex, percent) {
   const g = Math.min(255, Math.max(0, ((num >> 8) & 0x00FF) + ((num >> 8) & 0x00FF) * percent));
   const b = Math.min(255, Math.max(0, (num & 0x0000FF) + (num & 0x0000FF) * percent));
   return '#' + (0x1000000 + (r << 16) + (g << 8) + b).toString(16).slice(1);
+}
+
+/** 圆角矩形路径（仅 path，兼容无 roundRect 的环境），r 为圆角半径 */
+function roundRectPath(ctx, x, y, w, h, r) {
+  if (r <= 0 || r >= w / 2 || r >= h / 2) {
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    return;
+  }
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arc(x + w - r, y + r, r, -Math.PI / 2, 0);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arc(x + w - r, y + h - r, r, 0, Math.PI / 2);
+  ctx.lineTo(x + r, y + h);
+  ctx.arc(x + r, y + h - r, r, Math.PI / 2, Math.PI);
+  ctx.lineTo(x, y + r);
+  ctx.arc(x + r, y + r, r, Math.PI, Math.PI * 1.5);
+  ctx.closePath();
 }
 
 /** 下落位置缓动：ease-out quad */
@@ -1504,26 +1583,80 @@ function getMapTouchLevel(clientX, clientY) {
   var row = Math.floor((clientY - contentY - MAP_TOP) / cellH);
   var col = Math.floor((clientX - contentX) / cellW);
   if (row < 0 || row >= MAP_ROWS || col < 0 || col >= MAP_COLS) return null;
-  var levelId = levelMapPage * LEVELS_PER_PAGE + row * MAP_COLS + col + 1;
-  return levelId;
+  return levelMapPage * LEVELS_PER_PAGE + row * MAP_COLS + col + 1;
 }
 function ensureLevelMapPageInRange() {
   if (levelMapPage < 0) levelMapPage = 0;
 }
 
-var btnRankRect = null; // 排行榜按钮，用于地图上的 hitTest
+var btnRankRect = null; // 排行榜按钮（开局界面或原地图）
 var btnRankCloseRect = null; // 排行榜关闭按钮
 var RANK_PANEL_W = 300;
 var RANK_PANEL_H = 380;
+
+var btnStartFrom1Rect = null;
+var btnStartContinueRect = null;
+
+function renderStart() {
+  var w = canvas.width;
+  var h = canvas.height;
+  if (bgImage && bgImage.width > 0 && bgImage.height > 0) {
+    ctx.drawImage(bgImage, 0, 0, w, h);
+  } else {
+    ctx.fillStyle = '#16213e';
+    ctx.fillRect(0, 0, w, h);
+  }
+  ctx.fillStyle = '#eee';
+  ctx.font = '22px ' + FONT_FAMILY;
+  ctx.textAlign = 'center';
+  ctx.fillText('三消乐园', contentX + contentWidth / 2, contentY + 50);
+  ctx.font = '16px ' + FONT_FAMILY;
+  ctx.fillText('请选择开始方式', contentX + contentWidth / 2, contentY + 90);
+  var btnW = Math.min(220, contentWidth - 40);
+  var btnH = 44;
+  var cx = contentX + contentWidth / 2;
+  var y1 = contentY + 130;
+  var y2 = contentY + 130 + btnH + 16;
+  var y3 = contentY + 130 + (btnH + 16) * 2;
+  ctx.fillStyle = '#2a4a7c';
+  ctx.fillRect(cx - btnW / 2, y1, btnW, btnH);
+  ctx.strokeStyle = '#4a7c9e';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(cx - btnW / 2, y1, btnW, btnH);
+  ctx.fillStyle = '#fff';
+  ctx.font = '16px ' + FONT_FAMILY;
+  ctx.fillText('从第一关开始', cx, y1 + btnH / 2 + 5);
+  btnStartFrom1Rect = { x: cx - btnW / 2, y: y1, w: btnW, h: btnH };
+  ctx.fillStyle = '#4a7c59';
+  ctx.fillRect(cx - btnW / 2, y2, btnW, btnH);
+  ctx.strokeRect(cx - btnW / 2, y2, btnW, btnH);
+  ctx.fillStyle = '#fff';
+  ctx.fillText('从上次关卡继续', cx, y2 + btnH / 2 + 5);
+  btnStartContinueRect = { x: cx - btnW / 2, y: y2, w: btnW, h: btnH };
+  var rankBtnW = 120;
+  var rankBtnH = 32;
+  ctx.fillStyle = '#6b4a7c';
+  ctx.fillRect(cx - rankBtnW / 2, y3, rankBtnW, rankBtnH);
+  ctx.strokeStyle = '#eee';
+  ctx.strokeRect(cx - rankBtnW / 2, y3, rankBtnW, rankBtnH);
+  ctx.fillStyle = '#fff';
+  ctx.font = '15px ' + FONT_FAMILY;
+  ctx.fillText('排行榜', cx, y3 + rankBtnH / 2 + 5);
+  btnRankRect = { x: cx - rankBtnW / 2, y: y3, w: rankBtnW, h: rankBtnH };
+}
 
 function renderMap() {
   ensureLevelMapPageInRange();
   var w = canvas.width;
   var h = canvas.height;
+  if (bgImage && bgImage.width > 0 && bgImage.height > 0) {
+    ctx.drawImage(bgImage, 0, 0, w, h);
+  } else {
+    ctx.fillStyle = '#16213e';
+    ctx.fillRect(0, 0, w, h);
+  }
   var cellW = contentWidth / MAP_COLS;
   var cellH = (contentHeight - MAP_TOP - MAP_BOTTOM) / MAP_ROWS;
-  ctx.fillStyle = '#16213e';
-  ctx.fillRect(0, 0, w, h);
   ctx.fillStyle = '#eee';
   ctx.font = '18px ' + FONT_FAMILY;
   ctx.textAlign = 'center';
@@ -1652,43 +1785,49 @@ function render() {
     w = w || 375;
     h = h || 375;
   }
-  ctx.fillStyle = '#16213e';
-  ctx.fillRect(0, 0, w, h);
+  if (bgImage && bgImage.width > 0 && bgImage.height > 0) {
+    ctx.drawImage(bgImage, 0, 0, w, h);
+  } else {
+    ctx.fillStyle = '#16213e';
+    ctx.fillRect(0, 0, w, h);
+  }
   if (!grid || grid.length === 0 || cellSize <= 0) return;
   if (screenShakeFrames > 0) {
     ctx.save();
     ctx.translate(screenShakeX, screenShakeY);
   }
 
-  var hudY = contentY + 14;
+  var hudLeft = contentX + Math.max(4, safeInsetLeft);
+  var hudY = contentY + Math.max(14, safeInsetTop + 8);
   var lineH = 16;
   ctx.fillStyle = '#eee';
   ctx.font = '13px ' + FONT_FAMILY;
   ctx.textAlign = 'left';
-  ctx.fillText('步数: ' + movesLeft, offsetX, hudY);
+  ctx.fillText('步数: ' + movesLeft, hudLeft, hudY);
   for (var i = 0; i < currentGoals.length; i++) {
     var goal = currentGoals[i];
     var y = hudY + (i + 1) * lineH;
     if (goal.type === 'score') {
       ctx.fillStyle = '#eee';
-      ctx.fillText('分数: ' + score + ' / ' + goal.value, offsetX, y);
+      ctx.fillText('分数: ' + score + ' / ' + goal.value, hudLeft, y);
     } else if (goal.type === 'collect') {
       var prog = goalProgress['collect_' + goal.color] || 0;
       var name = COLOR_NAMES[goal.color] != null ? COLOR_NAMES[goal.color] : ('色' + goal.color);
       ctx.fillStyle = COLORS[goal.color] || '#eee';
-      ctx.fillText(name + ': ' + prog + ' / ' + goal.amount, offsetX, y);
+      ctx.fillText(name + ': ' + prog + ' / ' + goal.amount, hudLeft, y);
     }
   }
   ctx.fillStyle = '#eee';
   var potentialTotal = getPotentialTotalScoreForRank();
-  var rankPanelX = contentX + contentWidth - MINIPANEL_W - 10;
-  var rankPanelY = contentY + 8;
+  var rankPanelX = contentX + contentWidth - MINIPANEL_W - Math.max(RANK_PANEL_RIGHT_MARGIN, safeInsetRight + 16);
+  var rankPanelY = contentY + Math.max(8, safeInsetTop + 4);
+  var rankPanelTotalH = MINIPANEL_H + RANK_PANEL_EXTRA;
   if (gameScene === 'play') {
     ctx.fillStyle = 'rgba(22,33,62,0.92)';
-    ctx.fillRect(rankPanelX, rankPanelY, MINIPANEL_W, MINIPANEL_H);
+    ctx.fillRect(rankPanelX, rankPanelY, MINIPANEL_W, rankPanelTotalH);
     ctx.strokeStyle = '#4a7c9e';
     ctx.lineWidth = 2;
-    ctx.strokeRect(rankPanelX, rankPanelY, MINIPANEL_W, MINIPANEL_H);
+    ctx.strokeRect(rankPanelX, rankPanelY, MINIPANEL_W, rankPanelTotalH);
     ctx.fillStyle = '#fff';
     ctx.font = '14px ' + FONT_FAMILY;
     ctx.textAlign = 'left';
@@ -1696,6 +1835,9 @@ function render() {
     ctx.font = '12px ' + FONT_FAMILY;
     ctx.fillStyle = 'rgba(255,255,255,0.9)';
     ctx.fillText('加载中，真机显示排名', rankPanelX + 10, rankPanelY + 40);
+    ctx.font = '12px ' + FONT_FAMILY;
+    ctx.fillStyle = 'rgba(255,255,255,0.95)';
+    ctx.fillText('总得分: ' + Math.floor(potentialTotal), rankPanelX + 10, rankPanelY + MINIPANEL_H + 16);
   }
   try {
     var openCtx = wx.getOpenDataContext && wx.getOpenDataContext();
@@ -1988,14 +2130,22 @@ function render() {
       const y = offsetY + r * cellSize;
       const key = r + ',' + c;
       if (isWall(r, c)) {
+        var box = cellSize - pad * 2;
+        var cr = Math.max(2, Math.min(box / 5, 6));
+        roundRectPath(ctx, x + pad, y + pad, box, box, cr);
         ctx.fillStyle = USE_SIMPLE_GRID ? '#4a4a6a' : '#3d3d5c';
-        ctx.fillRect(x + 2, y + 2, cellSize - 4, cellSize - 4);
+        ctx.fill();
         ctx.strokeStyle = USE_SIMPLE_GRID ? '#6a6a9a' : '#5c5c8a';
         ctx.lineWidth = USE_SIMPLE_GRID ? 2 : 1;
-        ctx.strokeRect(x + 2, y + 2, cellSize - 4, cellSize - 4);
+        ctx.stroke();
       } else if (grid[r][c] < 0 && (!fillSet || !fillSet.has(key)) && (!dropTargetSet || !dropTargetSet.has(key))) {
+        var cr0 = Math.max(2, Math.min(cellSize / 5, 6));
+        roundRectPath(ctx, x, y, cellSize, cellSize, cr0);
         ctx.fillStyle = (iceGrid[r] && iceGrid[r][c] > 0) ? 'rgba(200,230,255,0.45)' : (USE_SIMPLE_GRID ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.08)');
-        ctx.fillRect(x, y, cellSize, cellSize);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
       }
     }
   }
@@ -2043,7 +2193,7 @@ function render() {
     ctx.fillStyle = '#5c5c8a';
     ctx.fillRect(btnX, btnMapY, btnW, btnH);
     ctx.fillStyle = '#fff';
-    ctx.fillText('返回地图', contentX + contentWidth / 2, btnMapY + 24);
+    ctx.fillText('返回', contentX + contentWidth / 2, btnMapY + 24);
     btnMapRect = { x: btnX, y: btnMapY, w: btnW, h: btnH };
     if (overlay === 'win') {
       btnNextRect = { x: btnX, y: btnY, w: btnW, h: btnH };
@@ -2085,6 +2235,7 @@ function bindTouch() {
 function main() {
   initCanvas();
   loadGemImages();
+  loadBackgroundImage();
   if (typeof wx !== 'undefined' && wx.loadFont) {
     try {
       var loaded = wx.loadFont('fonts/cartoon.ttf') || wx.loadFont('fonts/ZCOOLKuaiLe-Regular.ttf');
@@ -2093,10 +2244,19 @@ function main() {
   }
   bindTouch();
   saveData = loadSave();
-  gameScene = 'map';
-  levelMapPage = Math.floor(((saveData && saveData.maxUnlockedLevel) || 1 - 1) / LEVELS_PER_PAGE);
-  if (levelMapPage < 0) levelMapPage = 0;
-  renderMap();
+  gameScene = 'start';
+  renderStart();
+  if (typeof wx !== 'undefined') {
+    try {
+      wx.showShareMenu && wx.showShareMenu({ withShareTimeline: true });
+      wx.onShareAppMessage && wx.onShareAppMessage(function () {
+        return { title: '三消乐园', imageUrl: lastShareImagePath || '' };
+      });
+      wx.onShareTimeline && wx.onShareTimeline(function () {
+        return { title: '三消乐园', imageUrl: lastShareImagePath || '' };
+      });
+    } catch (e) {}
+  }
 }
 
 main();
