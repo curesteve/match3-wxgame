@@ -1,5 +1,6 @@
 {
   "description": "三消游戏 - 阶段一",
+  "cloudfunctionRoot": "cloudfunctions/",
   "packOptions": {
     "ignore": [],
     "include": []

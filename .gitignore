@@ -7,3 +7,6 @@ Thumbs.db
 
 # 日志
 *.log
+
+# 云函数依赖（云端安装）
+cloudfunctions/*/node_modules/

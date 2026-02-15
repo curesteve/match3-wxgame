@@ -1,7 +1,43 @@
 /**
  * 三消游戏 - 阶段四（微信小游戏）
  * 糖果风色块、果冻弹性下落、炫酷消除特效、音效、特殊块
+ * 当前版本：M1
  */
+var GAME_VERSION = 'M1';
+
+// 云开发持久化：环境 ID，开通云开发后替换为你的环境 ID；空字符串则不同步云端
+var CLOUD_ENV = 'cloud1-8gebksxb1f687118';
+var currentUserId = null;
+var dataService = {
+  ensureUser: function (cb) {
+    if (typeof wx === 'undefined' || !wx.cloud || !wx.cloud.callFunction || !CLOUD_ENV) { if (cb) cb({ ok: false }); return; }
+    wx.cloud.callFunction({ name: 'userEnsure' }).then(function (res) {
+      var result = res.result;
+      if (cb) cb(result && result.ok ? result : { ok: false });
+    }).catch(function () { if (cb) cb({ ok: false }); });
+  },
+  getProgress: function (userId, cb) {
+    if (typeof wx === 'undefined' || !wx.cloud || !wx.cloud.callFunction || !CLOUD_ENV || !userId) { if (cb) cb({ ok: false }); return; }
+    wx.cloud.callFunction({ name: 'progressGet', data: { userId: userId } }).then(function (res) {
+      var result = res.result;
+      if (cb) cb(result && result.ok ? result : { ok: false });
+    }).catch(function () { if (cb) cb({ ok: false }); });
+  },
+  saveProgress: function (userId, data, cb) {
+    if (typeof wx === 'undefined' || !wx.cloud || !wx.cloud.callFunction || !CLOUD_ENV || !userId) { if (cb) cb({ ok: false }); return; }
+    wx.cloud.callFunction({ name: 'progressSave', data: { userId: userId, data: data } }).then(function (res) {
+      var result = res.result;
+      if (cb) cb(result && result.ok ? result : { ok: false });
+    }).catch(function () { if (cb) cb({ ok: false }); });
+  },
+  submitRecord: function (userId, record, cb) {
+    if (typeof wx === 'undefined' || !wx.cloud || !wx.cloud.callFunction || !CLOUD_ENV || !userId) { if (cb) cb({ ok: false }); return; }
+    wx.cloud.callFunction({ name: 'recordSubmit', data: { userId: userId, record: record } }).then(function (res) {
+      var result = res.result;
+      if (cb) cb(result && result.ok ? result : { ok: false });
+    }).catch(function () { if (cb) cb({ ok: false }); });
+  }
+};
 
 const COLS = 8;
 const ROWS = 8;
@@ -84,7 +120,7 @@ function generateLevelConfig(levelId) {
 // 阶段五：存档 key 与默认结构
 var SAVE_KEY = 'game_save';
 function getDefaultSave() {
-  return { version: 1, maxUnlockedLevel: 1, stars: {}, bestScorePerLevel: {}, gameRecords: [] };
+  return { version: 1, maxUnlockedLevel: 1, stars: {}, bestScorePerLevel: {}, gameRecords: [], updatedAt: 0 };
 }
 function loadSave() {
   try {
@@ -96,6 +132,7 @@ function loadSave() {
     if (!Array.isArray(data.gameRecords)) data.gameRecords = [];
     if (typeof data.maxUnlockedLevel !== 'number') data.maxUnlockedLevel = 1;
     if (!data.version) data.version = 1;
+    if (typeof data.updatedAt !== 'number') data.updatedAt = 0;
     return data;
   } catch (e) {
     return getDefaultSave();
@@ -1113,7 +1150,7 @@ function gameLoop(now) {
             var curBest = saveData.bestScorePerLevel[currentLevelId];
             saveData.bestScorePerLevel[currentLevelId] = (curBest == null ? score : Math.max(curBest, score));
             if (!saveData.gameRecords) saveData.gameRecords = [];
-            saveData.gameRecords.push({
+            var recordWin = {
               levelId: currentLevelId,
               durationSec: Math.round(durationSec * 100) / 100,
               movesUsed: initialMovesForLevel - movesLeft,
@@ -1126,9 +1163,19 @@ function gameLoop(now) {
               elim6Plus: elim6PlusCount,
               win: true,
               timestamp: typeof Date.now === 'function' ? Date.now() : 0
-            });
-            // 对局记录已写入 saveData.gameRecords，可在此处通过 wx.request 上报到后台供调阅
+            };
+            saveData.gameRecords.push(recordWin);
+            saveData.updatedAt = typeof Date.now === 'function' ? Date.now() : 0;
             saveSave(saveData);
+            if (currentUserId) {
+              dataService.saveProgress(currentUserId, {
+                maxUnlockedLevel: saveData.maxUnlockedLevel,
+                stars: saveData.stars,
+                bestScorePerLevel: saveData.bestScorePerLevel,
+                updatedAt: saveData.updatedAt
+              }, function () {});
+              dataService.submitRecord(currentUserId, recordWin, function () {});
+            }
             submitScoreForRank(getTotalScoreForRank());
           }
           overlay = 'win';
@@ -1138,7 +1185,7 @@ function gameLoop(now) {
             var durationMs = (typeof Date.now === 'function' ? Date.now() : 0) - levelStartTime;
             var durationSec = Math.max(0, durationMs / 1000);
             if (!saveData.gameRecords) saveData.gameRecords = [];
-            saveData.gameRecords.push({
+            var recordFail = {
               levelId: currentLevelId,
               durationSec: Math.round(durationSec * 100) / 100,
               movesUsed: initialMovesForLevel - movesLeft,
@@ -1151,8 +1198,19 @@ function gameLoop(now) {
               elim6Plus: elim6PlusCount,
               win: false,
               timestamp: typeof Date.now === 'function' ? Date.now() : 0
-            });
+            };
+            saveData.gameRecords.push(recordFail);
+            saveData.updatedAt = typeof Date.now === 'function' ? Date.now() : 0;
             saveSave(saveData);
+            if (currentUserId) {
+              dataService.saveProgress(currentUserId, {
+                maxUnlockedLevel: saveData.maxUnlockedLevel,
+                stars: saveData.stars,
+                bestScorePerLevel: saveData.bestScorePerLevel,
+                updatedAt: saveData.updatedAt
+              }, function () {});
+              dataService.submitRecord(currentUserId, recordFail, function () {});
+            }
           }
           overlay = 'fail';
           playSound('fail');
@@ -2233,6 +2291,9 @@ function bindTouch() {
 }
 
 function main() {
+  if (typeof wx !== 'undefined' && wx.cloud && CLOUD_ENV) {
+    try { wx.cloud.init({ env: CLOUD_ENV }); } catch (e) {}
+  }
   initCanvas();
   loadGemImages();
   loadBackgroundImage();
@@ -2246,6 +2307,27 @@ function main() {
   saveData = loadSave();
   gameScene = 'start';
   renderStart();
+  if (typeof wx !== 'undefined' && wx.cloud && CLOUD_ENV) {
+    dataService.ensureUser(function (res) {
+      if (!res.ok || !res.userId) return;
+      currentUserId = res.userId;
+      dataService.getProgress(currentUserId, function (prog) {
+        if (!prog.ok || !prog.data) return;
+        var cloudData = prog.data;
+        var localUpdated = (saveData && saveData.updatedAt) ? saveData.updatedAt : 0;
+        var cloudUpdated = (cloudData && cloudData.updatedAt) ? cloudData.updatedAt : 0;
+        if (cloudUpdated >= localUpdated && cloudData.maxUnlockedLevel != null) {
+          saveData = saveData || getDefaultSave();
+          saveData.maxUnlockedLevel = cloudData.maxUnlockedLevel;
+          if (cloudData.stars && typeof cloudData.stars === 'object') saveData.stars = cloudData.stars;
+          if (cloudData.bestScorePerLevel && typeof cloudData.bestScorePerLevel === 'object') saveData.bestScorePerLevel = cloudData.bestScorePerLevel;
+          saveData.updatedAt = cloudUpdated;
+          saveSave(saveData);
+          renderStart();
+        }
+      });
+    });
+  }
   if (typeof wx !== 'undefined') {
     try {
       wx.showShareMenu && wx.showShareMenu({ withShareTimeline: true });

@@ -1,0 +1,6 @@
+当前版本：微信云开发持久化
+
+- 接入微信云开发，存档与记录云端持久化
+- 数据访问抽象，便于后续迁自建库
+- 云函数：userEnsure / progressGet / progressSave / recordSubmit
+- .gitignore 忽略云函数 node_modules
