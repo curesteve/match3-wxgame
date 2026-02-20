@@ -36,6 +36,20 @@ var dataService = {
       var result = res.result;
       if (cb) cb(result && result.ok ? result : { ok: false });
     }).catch(function () { if (cb) cb({ ok: false }); });
+  },
+  submitGlobalRank: function (userId, totalScore, cb) {
+    if (typeof wx === 'undefined' || !wx.cloud || !wx.cloud.callFunction || !CLOUD_ENV || !userId) { if (cb) cb({ ok: false }); return; }
+    wx.cloud.callFunction({ name: 'rankSubmit', data: { userId: userId, totalScore: totalScore } }).then(function (res) {
+      var result = res.result;
+      if (cb) cb(result && result.ok ? result : { ok: false });
+    }).catch(function () { if (cb) cb({ ok: false }); });
+  },
+  getGlobalRank: function (cb) {
+    if (typeof wx === 'undefined' || !wx.cloud || !wx.cloud.callFunction || !CLOUD_ENV) { if (cb) cb({ ok: false, list: [] }); return; }
+    wx.cloud.callFunction({ name: 'rankList', data: { limit: 50 } }).then(function (res) {
+      var result = res.result;
+      if (cb) cb(result && result.ok ? { ok: true, list: result.list || [] } : { ok: false, list: [] });
+    }).catch(function () { if (cb) cb({ ok: false, list: [] }); });
   }
 };
 
@@ -94,18 +108,30 @@ let touchStartY = 0;
 
 const MIN_SWIPE_PX = 18; // 最小滑动距离（像素），小于则视为点击忽略
 
-// 无限关卡模式：按关卡序号递进难度生成配置，无固定列表
+// 无限关卡模式：难度由「过关积分/步数」与「色块数量/步数」共同控制；每三关出现一关含色块消除
 function generateLevelConfig(levelId) {
   if (levelId < 1) return null;
-  var moves = Math.max(8, 22 - Math.floor((levelId - 1) / 2)); // 22→10 随关卡递减，最少 8 步
-  var targetScore = 400 + levelId * 70; // 分数目标随关卡递增
+  var d = levelId; // 综合难度指数
+  var moves = Math.max(8, 20 - Math.floor(d / 3)); // 步数随难度缓慢递减
+  var targetScore = 350 + d * 75; // 分数/步数 控制难度
   var config = { id: levelId, moves: moves, targetScore: targetScore };
-  if (levelId % 4 === 0) {
-    var color = (levelId - 1) % GEM_TYPES;
-    var amount = 10 + Math.floor(levelId / 3);
-    config.goals = [{ type: 'score', value: targetScore }, { type: 'collect', color: color, amount: amount }];
-  } else {
-    config.goals = [{ type: 'score', value: targetScore }];
+  config.goals = [{ type: 'score', value: targetScore }];
+  if (levelId % 3 === 0) {
+    var collectPerMove = 0.35 + d * 0.015; // 色块数量/步数 随难度递进，与分数/步数共同控制难度
+    var maxCollect = Math.max(4, Math.min(moves - 2, Math.floor(moves * collectPerMove))); // 最多的一种色块数量
+    var numColors = levelId % 5 || 5; // 色块颜色数 = 关卡数 % 5，余 0 视为 5
+    var used = {};
+    for (var nc = 0; nc < numColors; nc++) {
+      var color = (levelId - 1 + nc) % GEM_TYPES;
+      if (used[color]) {
+        for (var c2 = 0; c2 < GEM_TYPES; c2++) {
+          if (!used[c2]) { color = c2; break; }
+        }
+      }
+      used[color] = true;
+      var amount = nc === 0 ? maxCollect : Math.max(2, Math.min(maxCollect - 1, maxCollect - nc * 2)); // 其余色块小于最多数量
+      config.goals.push({ type: 'collect', color: color, amount: amount });
+    }
   }
   if (levelId >= 6 && levelId % 5 === 1) {
     var r = levelId % 4;
@@ -117,10 +143,34 @@ function generateLevelConfig(levelId) {
   return config;
 }
 
-// 阶段五：存档 key 与默认结构
+// 阶段五：存档 key 与默认结构（含货币、体力、任务）
 var SAVE_KEY = 'game_save';
+var STAMINA_MAX = 5;
+var STAMINA_RECOVER_MS = 5 * 60 * 1000; // 5 分钟恢复 1 点
+var STAMINA_GOLD_COST = 100; // 体力不足时可用金币购买 1 点体力的价格
 function getDefaultSave() {
-  return { version: 1, maxUnlockedLevel: 1, stars: {}, bestScorePerLevel: {}, gameRecords: [], updatedAt: 0 };
+  return {
+    version: 1,
+    maxUnlockedLevel: 1,
+    stars: {},
+    bestScorePerLevel: {},
+    gameRecords: [],
+    updatedAt: 0,
+    gold: 0,
+    stamina: STAMINA_MAX,
+    lastStaminaTime: 0,
+    taskProgress: {},
+    taskEvents: [],
+    lastDailyReset: '',
+    lastWeeklyReset: '',
+    sessionActive: false,
+    resumableLevelId: 1,
+    levelStuckCount: {},
+    levelAdjustments: {},
+    fourMatchRewardCounter: 0,
+    fourMatchGoldClaimedDate: '',
+    fourMatchGoldClaimedToday: 0
+  };
 }
 function loadSave() {
   try {
@@ -133,6 +183,20 @@ function loadSave() {
     if (typeof data.maxUnlockedLevel !== 'number') data.maxUnlockedLevel = 1;
     if (!data.version) data.version = 1;
     if (typeof data.updatedAt !== 'number') data.updatedAt = 0;
+    if (typeof data.gold !== 'number') data.gold = 0;
+    if (typeof data.stamina !== 'number') data.stamina = STAMINA_MAX;
+    if (typeof data.lastStaminaTime !== 'number') data.lastStaminaTime = 0;
+    if (!data.taskProgress || typeof data.taskProgress !== 'object') data.taskProgress = {};
+    if (!Array.isArray(data.taskEvents)) data.taskEvents = [];
+    if (typeof data.lastDailyReset !== 'string') data.lastDailyReset = '';
+    if (typeof data.lastWeeklyReset !== 'string') data.lastWeeklyReset = '';
+    if (typeof data.sessionActive !== 'boolean') data.sessionActive = false;
+    if (typeof data.resumableLevelId !== 'number') data.resumableLevelId = 1;
+    if (!data.levelStuckCount || typeof data.levelStuckCount !== 'object') data.levelStuckCount = {};
+    if (!data.levelAdjustments || typeof data.levelAdjustments !== 'object') data.levelAdjustments = {};
+    if (typeof data.fourMatchRewardCounter !== 'number') data.fourMatchRewardCounter = 0;
+    if (typeof data.fourMatchGoldClaimedDate !== 'string') data.fourMatchGoldClaimedDate = '';
+    if (typeof data.fourMatchGoldClaimedToday !== 'number') data.fourMatchGoldClaimedToday = 0;
     return data;
   } catch (e) {
     return getDefaultSave();
@@ -143,11 +207,312 @@ function saveSave(data) {
     if (wx.setStorageSync) wx.setStorageSync(SAVE_KEY, JSON.stringify(data));
   } catch (e) {}
 }
+/** 当前体力（按时间恢复计算，不写档） */
+function getCurrentStamina() {
+  if (!saveData) return 0;
+  var now = typeof Date.now === 'function' ? Date.now() : 0;
+  var elapsed = now - (saveData.lastStaminaTime || 0);
+  var recovered = Math.floor(elapsed / STAMINA_RECOVER_MS);
+  return Math.min(STAMINA_MAX, (saveData.stamina || 0) + recovered);
+}
+/** 消耗 1 点体力，成功返回 true 并写档 */
+function consumeStamina() {
+  if (!saveData) return false;
+  var cur = getCurrentStamina();
+  if (cur < 1) return false;
+  var now = typeof Date.now === 'function' ? Date.now() : 0;
+  saveData.stamina = cur - 1;
+  saveData.lastStaminaTime = now;
+  saveSave(saveData);
+  return true;
+}
+/** 增加体力（任务奖励），最多到上限，并写档 */
+function addStamina(n) {
+  if (!saveData || n <= 0) return;
+  var cur = getCurrentStamina();
+  var now = typeof Date.now === 'function' ? Date.now() : 0;
+  saveData.stamina = Math.min(STAMINA_MAX, cur + n);
+  saveData.lastStaminaTime = now;
+  saveSave(saveData);
+}
+
+/** 消耗 1 点体力并执行 callback；若体力不足且金币够 100，弹窗确认后扣 100 金购买 1 体力再消耗并执行 callback */
+function tryConsumeStaminaOrBuyAndRun(callback) {
+  if (getCurrentStamina() >= 1) {
+    if (consumeStamina()) callback();
+    return;
+  }
+  var gold = saveData && typeof saveData.gold === 'number' ? saveData.gold : 0;
+  if (gold >= STAMINA_GOLD_COST && typeof wx !== 'undefined' && wx.showModal) {
+    wx.showModal({
+      title: '购买体力',
+      content: '消耗' + STAMINA_GOLD_COST + '金币购买1点体力？',
+      success: function (res) {
+        if (res.confirm && saveData && saveData.gold >= STAMINA_GOLD_COST) {
+          saveData.gold -= STAMINA_GOLD_COST;
+          saveSave(saveData);
+          addStamina(1);
+          if (consumeStamina()) callback();
+          persistProgressToCloud();
+        }
+      }
+    });
+    return;
+  }
+  if (typeof wx !== 'undefined' && wx.showToast) wx.showToast({ title: '体力不足', icon: 'none' });
+}
+
+// ---------- 任务系统：配置、周期、重置、事件记录 ----------
+/** 今日日期键 YYYY-MM-DD（本地） */
+function getDateKey() {
+  var d = new Date();
+  var y = d.getFullYear();
+  var m = (d.getMonth() + 1);
+  var day = d.getDate();
+  return y + '-' + (m < 10 ? '0' : '') + m + '-' + (day < 10 ? '0' : '') + day;
+}
+/** 本周周键：本周一日期 YYYY-MM-DD（本地，周一为起点） */
+function getWeekKey() {
+  var d = new Date();
+  d.setHours(0, 0, 0, 0);
+  var day = d.getDay();
+  var diff = day === 0 ? -6 : 1 - day;
+  var monday = new Date(d);
+  monday.setDate(d.getDate() + diff);
+  var y = monday.getFullYear();
+  var m = monday.getMonth() + 1;
+  var da = monday.getDate();
+  return y + '-' + (m < 10 ? '0' : '') + m + '-' + (da < 10 ? '0' : '') + da;
+}
+
+var TASK_CONFIG = [
+  { id: 'daily_1', type: 'daily', name: '完成1关', desc: '完成任意1局游戏', prerequisiteIds: [], difficulty: 1, rewardGold: 50, rewardStamina: 0, objective: { type: 'complete_levels', target: 1 } },
+  { id: 'daily_2', type: 'daily', name: '分享1次', desc: '分享给好友或朋友圈', prerequisiteIds: [], difficulty: 2, rewardGold: 100, rewardStamina: 0, objective: { type: 'share', target: 1 } },
+  { id: 'daily_3', type: 'daily', name: '完成3关', desc: '完成任意3局游戏', prerequisiteIds: [], difficulty: 3, rewardGold: 50, rewardStamina: 1, objective: { type: 'complete_levels', target: 3 } },
+  { id: 'weekly_1', type: 'weekly', name: '完成10关', desc: '本周完成10局游戏', prerequisiteIds: [], difficulty: 4, rewardGold: 200, rewardStamina: 0, objective: { type: 'complete_levels', target: 10 } },
+  { id: 'weekly_2', type: 'weekly', name: '四连5次', desc: '本周累计产生5次四连或以上消除', prerequisiteIds: ['weekly_1'], difficulty: 3, rewardGold: 50, rewardStamina: 1, objective: { type: 'make_4_match', target: 5 } }
+];
+
+function getTaskConfig() { return TASK_CONFIG; }
+
+/** 追加任务事件到 taskEvents，并可选限制条数 */
+function recordTaskEvent(taskId, eventType, payload) {
+  if (!saveData) return;
+  if (!Array.isArray(saveData.taskEvents)) saveData.taskEvents = [];
+  var periodKey = '';
+  var cfg = TASK_CONFIG.filter(function (t) { return t.id === taskId; })[0];
+  if (cfg) periodKey = cfg.type === 'daily' ? getDateKey() : getWeekKey();
+  saveData.taskEvents.push({
+    taskId: taskId,
+    eventType: eventType,
+    timestamp: typeof Date.now === 'function' ? Date.now() : 0,
+    periodKey: periodKey,
+    payload: payload || {}
+  });
+  var maxEvents = 500;
+  if (saveData.taskEvents.length > maxEvents) saveData.taskEvents = saveData.taskEvents.slice(-maxEvents);
+  saveSave(saveData);
+}
+
+/** 每日/每周重置：若跨天/跨周则清空对应类型任务进度并更新 lastDailyReset / lastWeeklyReset */
+function resetDailyWeeklyIfNeeded() {
+  if (!saveData) return;
+  var today = getDateKey();
+  var thisWeek = getWeekKey();
+  var changed = false;
+  if (saveData.lastDailyReset !== today) {
+    for (var i = 0; i < TASK_CONFIG.length; i++) {
+      if (TASK_CONFIG[i].type !== 'daily') continue;
+      var tid = TASK_CONFIG[i].id;
+      saveData.taskProgress[tid] = { status: 'locked', progress: 0 };
+    }
+    saveData.lastDailyReset = today;
+    changed = true;
+  }
+  if (saveData.lastWeeklyReset !== thisWeek) {
+    for (var j = 0; j < TASK_CONFIG.length; j++) {
+      if (TASK_CONFIG[j].type !== 'weekly') continue;
+      var tid2 = TASK_CONFIG[j].id;
+      saveData.taskProgress[tid2] = { status: 'locked', progress: 0 };
+    }
+    saveData.lastWeeklyReset = thisWeek;
+    changed = true;
+  }
+  if (changed) saveSave(saveData);
+  refreshTaskUnlockStatus();
+}
+
+/** 根据前置关系刷新各任务解锁状态，新解锁时写 unlock 事件 */
+function refreshTaskUnlockStatus() {
+  if (!saveData || !saveData.taskProgress) return;
+  for (var i = 0; i < TASK_CONFIG.length; i++) {
+    var task = TASK_CONFIG[i];
+    var tid = task.id;
+    var prog = saveData.taskProgress[tid];
+    if (!prog) saveData.taskProgress[tid] = { status: 'locked', progress: 0 };
+    prog = saveData.taskProgress[tid];
+    var allPrereqClaimed = true;
+    for (var p = 0; p < (task.prerequisiteIds || []).length; p++) {
+      var pre = saveData.taskProgress[task.prerequisiteIds[p]];
+      if (!pre || pre.status !== 'claimed') { allPrereqClaimed = false; break; }
+    }
+    var shouldUnlock = allPrereqClaimed;
+    if (shouldUnlock && prog.status === 'locked') {
+      saveData.taskProgress[tid].status = 'unlocked';
+      saveData.taskProgress[tid].unlockedAt = typeof Date.now === 'function' ? Date.now() : 0;
+      recordTaskEvent(tid, 'unlock', {});
+    }
+  }
+  saveSave(saveData);
+}
+
+var pendingTaskCompleteQueue = []; // 本局内完成的任务 id，用于弹窗「获取奖励」
+
+/** 推进任务进度：objectiveType 与 delta；达标的任务置为 completed 并写 complete 事件 */
+function updateTaskProgress(objectiveType, delta) {
+  if (!saveData || !saveData.taskProgress || delta <= 0) return;
+  var now = typeof Date.now === 'function' ? Date.now() : 0;
+  for (var i = 0; i < TASK_CONFIG.length; i++) {
+    var task = TASK_CONFIG[i];
+    var tid = task.id;
+    var prog = saveData.taskProgress[tid];
+    if (!prog || prog.status !== 'unlocked') continue;
+    var obj = task.objective;
+    if (!obj || obj.type !== objectiveType) continue;
+    prog.progress = (prog.progress || 0) + delta;
+    var target = obj.target || 1;
+    if (prog.progress >= target) {
+      saveData.taskProgress[tid].status = 'completed';
+      saveData.taskProgress[tid].completedAt = now;
+      recordTaskEvent(tid, 'complete', { progress: prog.progress, target: target });
+      pendingTaskCompleteQueue.push(tid);
+    }
+  }
+  saveSave(saveData);
+}
+
+/** 若有待展示的任务完成，弹出「任务完成」弹窗，按钮「获取奖励」点击后发放奖励 */
+function showNextTaskCompletePopup() {
+  if (!pendingTaskCompleteQueue.length) return;
+  var taskId = pendingTaskCompleteQueue.shift();
+  var task = TASK_CONFIG.filter(function (t) { return t.id === taskId; })[0];
+  if (!task || typeof wx === 'undefined' || !wx.showModal) {
+    if (pendingTaskCompleteQueue.length > 0) setTimeout(showNextTaskCompletePopup, 100);
+    return;
+  }
+  var rewardStr = [];
+  if (task.rewardGold) rewardStr.push(task.rewardGold + '金币');
+  if (task.rewardStamina) rewardStr.push(task.rewardStamina + '体力');
+  var rewardDesc = rewardStr.length ? ('\n奖励: ' + rewardStr.join('、')) : '\n奖励: 无';
+  var content = task.name + (task.desc ? '\n' + task.desc : '') + rewardDesc;
+  wx.showModal({
+    title: '任务完成',
+    content: content,
+    confirmText: '获取奖励',
+    showCancel: false,
+    success: function (res) {
+      if (res.confirm) {
+        if (claimTaskReward(taskId) && rewardStr.length) {
+          if (wx.showToast) wx.showToast({ title: '获得 ' + rewardStr.join('、'), icon: 'none', duration: 2000 });
+        }
+      }
+      if (pendingTaskCompleteQueue.length > 0) setTimeout(showNextTaskCompletePopup, 100);
+    }
+  });
+}
+
+/** 一局结束（过关或失败）时调用：更新 complete_levels 与 make_4_match 进度；每累计 5 次四连可领取 50 金币，每日最多领取 5 次 */
+function onLevelFinished(levelsCompleted, fourMatchCount) {
+  if (levelsCompleted > 0) updateTaskProgress('complete_levels', levelsCompleted);
+  if (fourMatchCount > 0) updateTaskProgress('make_4_match', fourMatchCount);
+  if (fourMatchCount > 0 && saveData) {
+    var today = getDateKey();
+    if (saveData.fourMatchGoldClaimedDate !== today) {
+      saveData.fourMatchGoldClaimedDate = today;
+      saveData.fourMatchGoldClaimedToday = 0;
+    }
+    saveData.fourMatchRewardCounter = (saveData.fourMatchRewardCounter || 0) + fourMatchCount;
+    var claimedToday = saveData.fourMatchGoldClaimedToday || 0;
+    while (saveData.fourMatchRewardCounter >= 5 && claimedToday < 5) {
+      saveData.fourMatchRewardCounter -= 5;
+      saveData.fourMatchGoldClaimedToday = claimedToday + 1;
+      claimedToday = saveData.fourMatchGoldClaimedToday;
+      saveData.gold = (saveData.gold || 0) + 50;
+      fourMatchGoldThisGame = (fourMatchGoldThisGame || 0) + 50;
+      if (typeof wx !== 'undefined' && wx.showToast) wx.showToast({ title: '任务达成：四连5次，获得50金币！', icon: 'none', duration: 2000 });
+      saveSave(saveData);
+    }
+    while (saveData.fourMatchRewardCounter >= 5) {
+      saveData.fourMatchRewardCounter -= 5;
+      saveSave(saveData);
+    }
+    saveSave(saveData);
+    persistProgressToCloud();
+  }
+}
+
+/** 构建用于云端持久化的完整进度对象（金币、任务、四连、关卡、排行相关等） */
+function getProgressPayload() {
+  if (!saveData) return null;
+  return {
+    maxUnlockedLevel: saveData.maxUnlockedLevel,
+    stars: saveData.stars,
+    bestScorePerLevel: saveData.bestScorePerLevel,
+    updatedAt: saveData.updatedAt,
+    gold: saveData.gold,
+    stamina: saveData.stamina,
+    lastStaminaTime: saveData.lastStaminaTime,
+    taskProgress: saveData.taskProgress,
+    taskEvents: saveData.taskEvents,
+    lastDailyReset: saveData.lastDailyReset,
+    lastWeeklyReset: saveData.lastWeeklyReset,
+    sessionActive: saveData.sessionActive,
+    resumableLevelId: saveData.resumableLevelId,
+    levelStuckCount: saveData.levelStuckCount,
+    levelAdjustments: saveData.levelAdjustments,
+    fourMatchRewardCounter: saveData.fourMatchRewardCounter,
+    fourMatchGoldClaimedDate: saveData.fourMatchGoldClaimedDate,
+    fourMatchGoldClaimedToday: saveData.fourMatchGoldClaimedToday
+  };
+}
+/** 将当前进度同步到云端数据库，防止进程关闭后丢失 */
+function persistProgressToCloud() {
+  if (!currentUserId || typeof dataService === 'undefined' || !dataService.saveProgress) return;
+  var payload = getProgressPayload();
+  if (payload) dataService.saveProgress(currentUserId, payload, function () {});
+}
+
+/** 领取任务奖励；仅 status === 'completed' 可领取。发放金币与体力后置为 claimed 并刷新解锁链 */
+function claimTaskReward(taskId) {
+  if (!saveData || !saveData.taskProgress) return false;
+  var task = TASK_CONFIG.filter(function (t) { return t.id === taskId; })[0];
+  if (!task) return false;
+  var prog = saveData.taskProgress[taskId];
+  if (!prog || prog.status !== 'completed') return false;
+  var now = typeof Date.now === 'function' ? Date.now() : 0;
+  saveData.gold = (saveData.gold || 0) + (task.rewardGold || 0);
+  if ((task.rewardStamina || 0) > 0) addStamina(task.rewardStamina);
+  saveData.taskProgress[taskId].status = 'claimed';
+  saveData.taskProgress[taskId].claimedAt = now;
+  recordTaskEvent(taskId, 'claim_reward', { rewardGold: task.rewardGold, rewardStamina: task.rewardStamina || 0 });
+  saveSave(saveData);
+  refreshTaskUnlockStatus();
+  persistProgressToCloud();
+  return true;
+}
+
 /** 历史最高总分（各关最佳分之和），用于好友排行上报 */
 function getTotalScoreForRank() {
   if (!saveData || !saveData.bestScorePerLevel) return 0;
   var sum = 0;
   for (var k in saveData.bestScorePerLevel) sum += saveData.bestScorePerLevel[k] || 0;
+  return sum;
+}
+/** 历史总星级（各关星级之和），用于好友星级排行上报 */
+function getTotalStarsForRank() {
+  if (!saveData || !saveData.stars) return 0;
+  var sum = 0;
+  for (var k in saveData.stars) sum += (saveData.stars[k] || 0);
   return sum;
 }
 /** 若本关以当前 score 结算，用于排行的总分（实时显示排名用） */
@@ -160,11 +525,25 @@ function getPotentialTotalScoreForRank() {
   return total + score;
 }
 var RANK_KEY = 'score';
+var RANK_KEY_LEVEL = 'level';
+var RANK_KEY_STARS = 'stars';
 var MINIPANEL_W = 200;
 var MINIPANEL_H = 52;
 var RANK_PANEL_EXTRA = 22; // 排名面板下方显示总得分的高度
 var lastMinipanelScoreSent = -1;
+/** 对局中用于排名展示的得分（仅关卡开始/通关/失败时更新，连续消除时不刷新） */
+var rankDisplayScore = 0;
 var lastShareImagePath = ''; // 最近一次截图路径，供分享到聊天/朋友圈使用
+var shareIntentTime = 0;     // 用户触发分享的时间，用于 onShow 回退计入分享任务
+var shareTaskCountedThisSession = false; // 本次分享流程是否已计入任务，避免 success 与 onShow 重复
+
+/** 仅在本轮分享流程中计入一次分享任务进度（success 或 onShow 谁先触发谁生效） */
+function tryCountShareTask() {
+  if (shareTaskCountedThisSession) return;
+  shareTaskCountedThisSession = true;
+  updateTaskProgress('share', 1);
+}
+
 function updateRankMinipanel(scoreForRank) {
   if (scoreForRank == null || scoreForRank < 0) return;
   var s = Math.floor(scoreForRank);
@@ -182,10 +561,14 @@ function updateRankMinipanel(scoreForRank) {
 var saveData = null; // 启动时由 main() 赋值为 loadSave()
 function submitScoreForRank(scoreForRank) {
   try {
-    if (!wx.setUserCloudStorage || typeof scoreForRank !== 'number') return;
-    wx.setUserCloudStorage({
-      KVDataList: [{ key: RANK_KEY, value: String(Math.max(0, Math.floor(scoreForRank))) }]
-    });
+    if (!wx.setUserCloudStorage) return;
+    var list = [];
+    if (typeof scoreForRank === 'number') list.push({ key: RANK_KEY, value: String(Math.max(0, Math.floor(scoreForRank))) });
+    var lv = saveData && typeof saveData.maxUnlockedLevel === 'number' ? saveData.maxUnlockedLevel : 0;
+    list.push({ key: RANK_KEY_LEVEL, value: String(Math.max(0, lv)) });
+    var st = getTotalStarsForRank();
+    list.push({ key: RANK_KEY_STARS, value: String(Math.max(0, st)) });
+    wx.setUserCloudStorage({ KVDataList: list });
   } catch (e) {}
 }
 
@@ -210,7 +593,13 @@ function doShareScreenshot() {
           itemList: ['分享给好友', '分享到朋友圈'],
           success: function (actionRes) {
             if (actionRes.tapIndex === 0) {
-              wx.shareAppMessage({ title: '三消乐园', imageUrl: lastShareImagePath });
+              shareIntentTime = Date.now();
+              shareTaskCountedThisSession = false;
+              wx.shareAppMessage({
+                title: '萌兽三消',
+                imageUrl: lastShareImagePath,
+                success: function () { tryCountShareTask(); }
+              });
             } else if (actionRes.tapIndex === 1) {
               if (wx.showModal) {
                 wx.showModal({
@@ -279,8 +668,9 @@ var targetScore = 500;
 var currentGoals = []; // 当前关 goals，来自 getLevelConfig
 var goalProgress = {}; // collect_0..collect_4 收集数量
 var overlay = null; // null | 'win' | 'fail'
+var pendingFailRecord = false; // 步数用尽时先只弹窗，用户选重试/返回再写入失败记录，以便支持「50金买3步」
 var lastEarnedStars = 0; // 本局过关获得的星级 1～3，供胜利面板与存档用
-var gameScene = 'start'; // 'start' | 'play' | 'rank'，开局选择 / 对局 / 排行榜（已取消关卡选择界面）
+var gameScene = 'start'; // 'start' | 'play' | 'rank' | 'tasks'
 var comboIndex = 0; // 连消序号，用于计分加成
 var levelStartTime = 0; // 本关开始时间戳，用于通关时间与时间加分
 var initialMovesForLevel = 20; // 本关总步数，用于记录使用步数
@@ -288,6 +678,7 @@ var elim3Count = 0;
 var elim4Count = 0;
 var elim5Count = 0;
 var elim6PlusCount = 0; // 本局 3/4/5/6+ 消次数，供对局记录与后台调阅
+var fourMatchGoldThisGame = 0; // 本局四连已获得的金币数（每5次四连50金）
 var wallGrid = []; // wallGrid[r][c] === true 表示墙
 var iceGrid = []; // iceGrid[r][c] 为冰块血量，0 表示无
 
@@ -472,25 +863,57 @@ function loadGemImages() {
   }
 }
 
+/** 当前关卡色块权重（用于卡关时增加某色比例），返回长度为 GEM_TYPES 的数组 */
+function getGemWeightsForLevel(levelId) {
+  var w = [];
+  for (var i = 0; i < GEM_TYPES; i++) w[i] = 1;
+  if (!saveData || !saveData.levelAdjustments) return w;
+  var adj = saveData.levelAdjustments[levelId];
+  if (!adj) return w;
+  if (typeof adj.scoreColor === 'number' && adj.scoreColor >= 0 && adj.scoreColor < GEM_TYPES && (adj.scoreFactor || 1) > 0) {
+    w[adj.scoreColor] = w[adj.scoreColor] * (adj.scoreFactor || 1);
+  }
+  if (adj.collectFactors && typeof adj.collectFactors === 'object') {
+    for (var c = 0; c < GEM_TYPES; c++) {
+      if (adj.collectFactors[c] > 0) w[c] = w[c] * adj.collectFactors[c];
+    }
+  }
+  return w;
+}
+
+/** 按权重随机返回 0..GEM_TYPES-1 */
+function weightedRandomGem(weights) {
+  var sum = 0;
+  for (var i = 0; i < GEM_TYPES; i++) sum += weights[i] || 1;
+  var r = Math.random() * sum;
+  for (var j = 0; j < GEM_TYPES; j++) {
+    r -= weights[j] || 1;
+    if (r < 0) return j;
+  }
+  return GEM_TYPES - 1;
+}
+
 function initGrid() {
+  var weights = getGemWeightsForLevel(currentLevelId);
   do {
     grid = [];
     for (let r = 0; r < ROWS; r++) {
       grid[r] = [];
       for (let c = 0; c < COLS; c++) {
-        grid[r][c] = Math.floor(Math.random() * GEM_TYPES);
+        grid[r][c] = weightedRandomGem(weights);
       }
     }
   } while (getMatches().length > 0);
 }
 
 function initGridFromData(gridData) {
+  var weights = getGemWeightsForLevel(currentLevelId);
   grid = [];
   for (let r = 0; r < ROWS; r++) {
     grid[r] = [];
     for (let c = 0; c < COLS; c++) {
       var val = gridData[r][c];
-      grid[r][c] = typeof val === 'number' && val >= 0 && val < GEM_TYPES ? val : Math.floor(Math.random() * GEM_TYPES);
+      grid[r][c] = typeof val === 'number' && val >= 0 && val < GEM_TYPES ? val : weightedRandomGem(weights);
     }
   }
 }
@@ -498,6 +921,10 @@ function initGridFromData(gridData) {
 function startLevel(levelId) {
   var config = getLevelConfig(levelId);
   if (!config) return;
+  if (saveData) {
+    saveData.resumableLevelId = levelId;
+    saveSave(saveData);
+  }
   lastMinipanelScoreSent = -1;
   currentLevelId = levelId;
   movesLeft = config.moves;
@@ -508,12 +935,15 @@ function startLevel(levelId) {
   elim4Count = 0;
   elim5Count = 0;
   elim6PlusCount = 0;
+  fourMatchGoldThisGame = 0;
+  rankDisplayScore = getTotalScoreForRank();
+  lastMinipanelScoreSent = -1;
   try {
     var openCtx = wx.getOpenDataContext && wx.getOpenDataContext();
     if (openCtx && openCtx.canvas) {
       openCtx.canvas.width = MINIPANEL_W;
       openCtx.canvas.height = MINIPANEL_H;
-      openCtx.postMessage({ type: 'minipanel', score: Math.floor(getPotentialTotalScoreForRank()) });
+      openCtx.postMessage({ type: 'minipanel', score: Math.floor(rankDisplayScore) });
     }
   } catch (e) {}
   var scoreGoal = null;
@@ -527,6 +957,7 @@ function startLevel(levelId) {
   goalProgress = {};
   for (var c = 0; c < GEM_TYPES; c++) goalProgress['collect_' + c] = 0;
   overlay = null;
+  pendingFailRecord = false;
   comboIndex = 0;
   state = 'idle';
   swapAnim = null;
@@ -572,6 +1003,17 @@ function startLevel(levelId) {
       if (wallGrid[r][c]) grid[r][c] = WALL;
     }
   }
+  if (config.walls && config.walls.length) {
+    var weights = getGemWeightsForLevel(currentLevelId);
+    for (var i = 0; i < config.walls.length; i++) {
+      var w = config.walls[i];
+      if (w[0] >= 0 && w[0] < ROWS && w[1] >= 0 && w[1] < COLS) {
+        wallGrid[w[0]][w[1]] = false;
+        grid[w[0]][w[1]] = weightedRandomGem(weights);
+        iceGrid[w[0]][w[1]] = 1;
+      }
+    }
+  }
   render();
   if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(playRenderLoop);
 }
@@ -586,14 +1028,21 @@ function playRenderLoop() {
   requestAnimationFrame(playRenderLoop);
 }
 
+/** 是否可参与三连判定（有冰的格子也可参与消除，但不可移动） */
+function isMatchable(r, c) {
+  if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return false;
+  var v = grid[r][c];
+  if (v < 0 || v >= GEM_TYPES) return false;
+  return true;
+}
+
 function getMatches() {
   const set = new Set();
   const add = (r, c) => set.add(r + ',' + c);
-  const isGem = (v) => v >= 0 && v < GEM_TYPES;
   for (let r = 0; r < ROWS; r++) {
     let run = 1;
     for (let c = 1; c <= COLS; c++) {
-      const same = c < COLS && isGem(grid[r][c]) && grid[r][c] === grid[r][c - 1];
+      const same = c < COLS && isMatchable(r, c) && isMatchable(r, c - 1) && grid[r][c] === grid[r][c - 1];
       if (same) run++;
       else {
         if (run >= 3) for (let i = c - run; i < c; i++) add(r, i);
@@ -604,7 +1053,7 @@ function getMatches() {
   for (let c = 0; c < COLS; c++) {
     let run = 1;
     for (let r = 1; r <= ROWS; r++) {
-      const same = r < ROWS && isGem(grid[r][c]) && grid[r][c] === grid[r - 1][c];
+      const same = r < ROWS && isMatchable(r, c) && isMatchable(r - 1, c) && grid[r][c] === grid[r - 1][c];
       if (same) run++;
       else {
         if (run >= 3) for (let i = r - run; i < r; i++) add(i, c);
@@ -744,12 +1193,26 @@ function swap(r1, c1, r2, c2) {
   const t = grid[r1][c1];
   grid[r1][c1] = grid[r2][c2];
   grid[r2][c2] = t;
+  var i1 = iceGrid[r1] && iceGrid[r1][c1];
+  var i2 = iceGrid[r2] && iceGrid[r2][c2];
+  if (iceGrid[r1]) iceGrid[r1][c1] = i2 || 0;
+  if (iceGrid[r2]) iceGrid[r2][c2] = i1 || 0;
 }
 
 function isAdjacent(r1, c1, r2, c2) {
   const dr = Math.abs(r1 - r2);
   const dc = Math.abs(c1 - c2);
   return (dr === 1 && dc === 0) || (dr === 0 && dc === 1);
+}
+
+function thawNeighbors(r, c) {
+  var dr = [-1, 1, 0, 0], dc = [0, 0, -1, 1];
+  for (var i = 0; i < 4; i++) {
+    var nr = r + dr[i], nc = c + dc[i];
+    if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS && !isWall(nr, nc) && iceGrid[nr] && iceGrid[nr][nc] > 0) {
+      iceGrid[nr][nc] = 0;
+    }
+  }
 }
 
 function removeMatches(matches, specialSpawns) {
@@ -769,12 +1232,13 @@ function removeMatches(matches, specialSpawns) {
     var m = matches[i];
     var r = m.row, c = m.col;
     var key = r + ',' + c;
+    thawNeighbors(r, c);
+    if (iceGrid[r]) iceGrid[r][c] = 0;
     if (specialSpawns && bombKey[key]) { grid[r][c] = BOMB; continue; }
     if (specialSpawns && lineKey[key]) {
       grid[r][c] = lineKey[key] === 'lineH' ? LINE_H : LINE_V;
       continue;
     }
-    if (iceGrid[r] && iceGrid[r][c] > 0) iceGrid[r][c]--;
     grid[r][c] = -1;
   }
 }
@@ -782,7 +1246,8 @@ function removeMatches(matches, specialSpawns) {
 function removeCells(cells) {
   for (var i = 0; i < cells.length; i++) {
     var r = cells[i].row, c = cells[i].col;
-    if (iceGrid[r] && iceGrid[r][c] > 0) iceGrid[r][c]--;
+    thawNeighbors(r, c);
+    if (iceGrid[r]) iceGrid[r][c] = 0;
     grid[r][c] = -1;
   }
 }
@@ -804,9 +1269,10 @@ function drop() {
 }
 
 function refill() {
+  var weights = getGemWeightsForLevel(currentLevelId);
   for (var r = 0; r < ROWS; r++) {
     for (var c = 0; c < COLS; c++) {
-      if (!isWall(r, c) && grid[r][c] < 0 && (iceGrid[r][c] || 0) === 0) grid[r][c] = Math.floor(Math.random() * GEM_TYPES);
+      if (!isWall(r, c) && grid[r][c] < 0 && (iceGrid[r][c] || 0) === 0) grid[r][c] = weightedRandomGem(weights);
     }
   }
 }
@@ -839,11 +1305,12 @@ function buildDropAnimsCorrect() {
 }
 
 function buildFillAnims() {
+  var weights = getGemWeightsForLevel(currentLevelId);
   fillAnims = [];
   for (var r = 0; r < ROWS; r++) {
     for (var c = 0; c < COLS; c++) {
       if (!isWall(r, c) && grid[r][c] < 0 && (iceGrid[r][c] || 0) === 0) {
-        var type = Math.floor(Math.random() * GEM_TYPES);
+        var type = weightedRandomGem(weights);
         grid[r][c] = type;
         fillAnims.push({ r: r, c: c, type: type, progress: 0 });
       }
@@ -896,6 +1363,7 @@ function onTouchStart(e) {
   const y = touch.clientY != null ? touch.clientY : touch.y;
   touchStartCell = getCellFromTouch(x, y);
   if (touchStartCell && isWall(touchStartCell.row, touchStartCell.col)) touchStartCell = null;
+  if (touchStartCell && iceGrid[touchStartCell.row] && iceGrid[touchStartCell.row][touchStartCell.col] > 0) touchStartCell = null;
   touchStartX = x;
   touchStartY = y;
 }
@@ -906,19 +1374,44 @@ function onTouchEnd(e) {
   const endX = touch.clientX != null ? touch.clientX : touch.x;
   const endY = touch.clientY != null ? touch.clientY : touch.y;
   if (gameScene === 'start') {
-    if (btnStartFrom1Rect && endX >= btnStartFrom1Rect.x && endX <= btnStartFrom1Rect.x + btnStartFrom1Rect.w && endY >= btnStartFrom1Rect.y && endY <= btnStartFrom1Rect.y + btnStartFrom1Rect.h) {
-      gameScene = 'play';
-      startLevel(1);
-      return;
-    }
     if (btnStartContinueRect && endX >= btnStartContinueRect.x && endX <= btnStartContinueRect.x + btnStartContinueRect.w && endY >= btnStartContinueRect.y && endY <= btnStartContinueRect.y + btnStartContinueRect.h) {
-      gameScene = 'play';
-      var startLevelId = (saveData && saveData.maxUnlockedLevel) ? saveData.maxUnlockedLevel : 1;
-      startLevel(startLevelId);
+      var canResume = saveData && saveData.sessionActive === true && saveData.resumableLevelId >= 1;
+      if (canResume) {
+        gameScene = 'play';
+        startLevel(saveData.resumableLevelId);
+        return;
+      }
+      tryConsumeStaminaOrBuyAndRun(function () {
+        if (saveData) {
+          saveData.sessionActive = true;
+          saveData.resumableLevelId = (saveData.maxUnlockedLevel >= 1) ? saveData.maxUnlockedLevel : 1;
+          saveSave(saveData);
+        }
+        gameScene = 'play';
+        var startLevelId = saveData && saveData.maxUnlockedLevel >= 1 ? saveData.maxUnlockedLevel : 1;
+        startLevel(startLevelId);
+      });
       return;
     }
     if (btnRankRect && endX >= btnRankRect.x && endX <= btnRankRect.x + btnRankRect.w && endY >= btnRankRect.y && endY <= btnRankRect.y + btnRankRect.h) {
       openRankPanel();
+      return;
+    }
+    if (btnTaskRect && endX >= btnTaskRect.x && endX <= btnTaskRect.x + btnTaskRect.w && endY >= btnTaskRect.y && endY <= btnTaskRect.y + btnTaskRect.h) {
+      gameScene = 'tasks';
+      tasksLoop();
+      return;
+    }
+    if (btnShareRect && endX >= btnShareRect.x && endX <= btnShareRect.x + btnShareRect.w && endY >= btnShareRect.y && endY <= btnShareRect.y + btnShareRect.h) {
+      if (typeof wx !== 'undefined' && wx.shareAppMessage) {
+        shareIntentTime = Date.now();
+        shareTaskCountedThisSession = false;
+        wx.shareAppMessage({
+          title: '萌兽三消',
+          imageUrl: lastShareImagePath || '',
+          success: function () { tryCountShareTask(); }
+        });
+      }
       return;
     }
     return;
@@ -928,7 +1421,76 @@ function onTouchEnd(e) {
       gameScene = 'start';
       btnRankCloseRect = null;
       renderStart();
+      return;
     }
+    if (btnRankFriendRect && endX >= btnRankFriendRect.x && endX <= btnRankFriendRect.x + btnRankFriendRect.w && endY >= btnRankFriendRect.y && endY <= btnRankFriendRect.y + btnRankFriendRect.h) {
+      rankTab = 'friend';
+      return;
+    }
+    if (btnRankGlobalRect && endX >= btnRankGlobalRect.x && endX <= btnRankGlobalRect.x + btnRankGlobalRect.w && endY >= btnRankGlobalRect.y && endY <= btnRankGlobalRect.y + btnRankGlobalRect.h) {
+      rankTab = 'global';
+      if (globalRankList.length === 0 && !globalRankLoading && typeof dataService !== 'undefined' && dataService.getGlobalRank) {
+        globalRankLoading = true;
+        dataService.getGlobalRank(function (res) {
+          globalRankLoading = false;
+          globalRankList = (res && res.list) ? res.list : [];
+        });
+      }
+      return;
+    }
+    if (rankTab === 'friend') {
+      if (btnRankScoreRect && endX >= btnRankScoreRect.x && endX <= btnRankScoreRect.x + btnRankScoreRect.w && endY >= btnRankScoreRect.y && endY <= btnRankScoreRect.y + btnRankScoreRect.h) {
+        friendRankType = 'score';
+        try {
+          var oc = wx.getOpenDataContext && wx.getOpenDataContext();
+          if (oc) oc.postMessage({ type: 'refresh', rankType: 'score' });
+        } catch (e) {}
+        return;
+      }
+      if (btnRankLevelRect && endX >= btnRankLevelRect.x && endX <= btnRankLevelRect.x + btnRankLevelRect.w && endY >= btnRankLevelRect.y && endY <= btnRankLevelRect.y + btnRankLevelRect.h) {
+        friendRankType = 'level';
+        try {
+          var oc2 = wx.getOpenDataContext && wx.getOpenDataContext();
+          if (oc2) oc2.postMessage({ type: 'refresh', rankType: 'level' });
+        } catch (e) {}
+        return;
+      }
+      if (btnRankStarsRect && endX >= btnRankStarsRect.x && endX <= btnRankStarsRect.x + btnRankStarsRect.w && endY >= btnRankStarsRect.y && endY <= btnRankStarsRect.y + btnRankStarsRect.h) {
+        friendRankType = 'stars';
+        try {
+          var oc3 = wx.getOpenDataContext && wx.getOpenDataContext();
+          if (oc3) oc3.postMessage({ type: 'refresh', rankType: 'stars' });
+        } catch (e) {}
+        return;
+      }
+    }
+    return;
+  }
+  if (gameScene === 'tasks') {
+    if (btnTaskCloseRect && endX >= btnTaskCloseRect.x && endX <= btnTaskCloseRect.x + btnTaskCloseRect.w && endY >= btnTaskCloseRect.y && endY <= btnTaskCloseRect.y + btnTaskCloseRect.h) {
+      gameScene = 'start';
+      btnTaskCloseRect = null;
+      taskClaimRects = [];
+      renderStart();
+      return;
+    }
+    for (var ti = 0; ti < taskClaimRects.length; ti++) {
+      var tr = taskClaimRects[ti];
+      if (endX >= tr.x && endX <= tr.x + tr.w && endY >= tr.y && endY <= tr.y + tr.h && claimTaskReward(tr.taskId)) {
+        if (typeof wx !== 'undefined' && wx.showToast) wx.showToast({ title: '领取成功', icon: 'success' });
+        renderTasks();
+        return;
+      }
+    }
+    return;
+  }
+  if (gameScene === 'play' && btnBackToMainRect && endX >= btnBackToMainRect.x && endX <= btnBackToMainRect.x + btnBackToMainRect.w && endY >= btnBackToMainRect.y && endY <= btnBackToMainRect.y + btnBackToMainRect.h) {
+    if (saveData) {
+      saveData.resumableLevelId = currentLevelId;
+      saveSave(saveData);
+    }
+    gameScene = 'start';
+    renderStart();
     return;
   }
   if (state !== 'idle') return;
@@ -971,6 +1533,7 @@ function onTouchEnd(e) {
   clearTouch();
   if (r1 === r2 && c1 === c2) return;
   if (isWall(r1, c1) || isWall(r2, c2)) return;
+  if ((iceGrid[r1] && iceGrid[r1][c1] > 0) || (iceGrid[r2] && iceGrid[r2][c2] > 0)) return;
 
   movesLeft--;
   swap(r1, c1, r2, c2);
@@ -993,7 +1556,61 @@ function onTouchCancel() {
 
 var btnNextRect = null;
 var btnRetryRect = null;
+var btnBuyStepsRect = null;
 var btnMapRect = null;
+
+/** 步数用尽后用户选择重试/返回时写入失败记录并上报（选「50金买3步」不调用） */
+function applyFailRecord() {
+  if (!pendingFailRecord || !saveData) return;
+  pendingFailRecord = false;
+  if (!saveData.levelStuckCount) saveData.levelStuckCount = {};
+  if (!saveData.levelAdjustments) saveData.levelAdjustments = {};
+  saveData.levelStuckCount[currentLevelId] = (saveData.levelStuckCount[currentLevelId] || 0) + 1;
+  if (saveData.levelStuckCount[currentLevelId] >= 5) {
+    var adj = saveData.levelAdjustments[currentLevelId] || {};
+    if (!adj.collectFactors) adj.collectFactors = {};
+    var goalColors = [];
+    if (currentGoals && currentGoals.length) {
+      for (var gx = 0; gx < currentGoals.length; gx++) {
+        if (currentGoals[gx].type === 'collect' && currentGoals[gx].color >= 0 && currentGoals[gx].color < GEM_TYPES) {
+          if (goalColors.indexOf(currentGoals[gx].color) < 0) goalColors.push(currentGoals[gx].color);
+        }
+      }
+    }
+    if (goalColors.length === 0) goalColors = [0];
+    for (var k = 0; k < goalColors.length; k++) {
+      var c = goalColors[k];
+      adj.collectFactors[c] = (adj.collectFactors[c] || 1) * 1.1;
+    }
+    saveData.levelAdjustments[currentLevelId] = adj;
+    saveData.levelStuckCount[currentLevelId] = 0;
+  }
+  var durationMs = (typeof Date.now === 'function' ? Date.now() : 0) - levelStartTime;
+  var durationSec = Math.max(0, durationMs / 1000);
+  if (!saveData.gameRecords) saveData.gameRecords = [];
+  var recordFail = {
+    levelId: currentLevelId,
+    durationSec: Math.round(durationSec * 100) / 100,
+    movesUsed: initialMovesForLevel - movesLeft,
+    totalMoves: initialMovesForLevel,
+    score: score,
+    stars: 0,
+    elim3: elim3Count,
+    elim4: elim4Count,
+    elim5: elim5Count,
+    elim6Plus: elim6PlusCount,
+    win: false,
+    timestamp: typeof Date.now === 'function' ? Date.now() : 0
+  };
+  saveData.gameRecords.push(recordFail);
+  saveData.updatedAt = typeof Date.now === 'function' ? Date.now() : 0;
+  saveSave(saveData);
+  setTimeout(showNextTaskCompletePopup, 300);
+  persistProgressToCloud();
+  if (currentUserId && typeof dataService !== 'undefined' && dataService.submitRecord) {
+    dataService.submitRecord(currentUserId, recordFail, function () {});
+  }
+}
 
 function handleOverlayTouch(e) {
   var touch = e.changedTouches && e.changedTouches[0];
@@ -1001,15 +1618,36 @@ function handleOverlayTouch(e) {
   var x = touch.clientX != null ? touch.clientX : touch.x;
   var y = touch.clientY != null ? touch.clientY : touch.y;
   if (btnMapRect && x >= btnMapRect.x && x <= btnMapRect.x + btnMapRect.w && y >= btnMapRect.y && y <= btnMapRect.y + btnMapRect.h) {
+    if (overlay === 'fail' && pendingFailRecord) applyFailRecord();
+    if (saveData) {
+      saveData.resumableLevelId = overlay === 'win' ? currentLevelId + 1 : currentLevelId;
+      saveSave(saveData);
+    }
     overlay = null;
     gameScene = 'start';
     renderStart();
     return;
   }
+  if (overlay === 'fail' && btnBuyStepsRect && x >= btnBuyStepsRect.x && x <= btnBuyStepsRect.x + btnBuyStepsRect.w && y >= btnBuyStepsRect.y && y <= btnBuyStepsRect.y + btnBuyStepsRect.h) {
+    if (saveData && (saveData.gold || 0) >= 50) {
+      saveData.gold -= 50;
+      movesLeft = 3;
+      overlay = null;
+      btnBuyStepsRect = null;
+      saveSave(saveData);
+      persistProgressToCloud();
+      if (typeof wx !== 'undefined' && wx.showToast) wx.showToast({ title: '已购买3步', icon: 'none' });
+      render();
+    } else if (typeof wx !== 'undefined' && wx.showToast) {
+      wx.showToast({ title: '金币不足（需50）', icon: 'none' });
+    }
+    return;
+  }
   if (overlay === 'win' && btnNextRect && x >= btnNextRect.x && x <= btnNextRect.x + btnNextRect.w && y >= btnNextRect.y && y <= btnNextRect.y + btnNextRect.h) {
     startLevel(currentLevelId + 1);
   } else if (overlay === 'fail' && btnRetryRect && x >= btnRetryRect.x && x <= btnRetryRect.x + btnRetryRect.w && y >= btnRetryRect.y && y <= btnRetryRect.y + btnRetryRect.h) {
-    startLevel(currentLevelId);
+    if (pendingFailRecord) applyFailRecord();
+    tryConsumeStaminaOrBuyAndRun(function () { startLevel(currentLevelId); });
   }
 }
 
@@ -1143,6 +1781,7 @@ function gameLoop(now) {
           if (score >= th.star3Score) stars = 3; else if (score >= th.star2Score) stars = 2;
           lastEarnedStars = stars;
           if (saveData) {
+            if (saveData.levelStuckCount) saveData.levelStuckCount[currentLevelId] = 0;
             var nextId = currentLevelId + 1;
             saveData.maxUnlockedLevel = Math.max(saveData.maxUnlockedLevel, nextId);
             var cur = saveData.stars[currentLevelId];
@@ -1167,52 +1806,30 @@ function gameLoop(now) {
             saveData.gameRecords.push(recordWin);
             saveData.updatedAt = typeof Date.now === 'function' ? Date.now() : 0;
             saveSave(saveData);
-            if (currentUserId) {
-              dataService.saveProgress(currentUserId, {
-                maxUnlockedLevel: saveData.maxUnlockedLevel,
-                stars: saveData.stars,
-                bestScorePerLevel: saveData.bestScorePerLevel,
-                updatedAt: saveData.updatedAt
-              }, function () {});
+            onLevelFinished(1, elim4Count + elim5Count + elim6PlusCount);
+            setTimeout(showNextTaskCompletePopup, 300);
+            persistProgressToCloud();
+            if (currentUserId && typeof dataService !== 'undefined' && dataService.submitRecord) {
               dataService.submitRecord(currentUserId, recordWin, function () {});
             }
             submitScoreForRank(getTotalScoreForRank());
+            rankDisplayScore = getTotalScoreForRank();
+            lastMinipanelScoreSent = -1;
+            if (currentUserId && typeof dataService !== 'undefined' && dataService.submitGlobalRank) {
+              dataService.submitGlobalRank(currentUserId, getTotalScoreForRank(), function () {});
+            }
           }
           overlay = 'win';
           playSound('win');
         } else if (movesLeft <= 0) {
-          if (saveData) {
-            var durationMs = (typeof Date.now === 'function' ? Date.now() : 0) - levelStartTime;
-            var durationSec = Math.max(0, durationMs / 1000);
-            if (!saveData.gameRecords) saveData.gameRecords = [];
-            var recordFail = {
-              levelId: currentLevelId,
-              durationSec: Math.round(durationSec * 100) / 100,
-              movesUsed: initialMovesForLevel - movesLeft,
-              totalMoves: initialMovesForLevel,
-              score: score,
-              stars: 0,
-              elim3: elim3Count,
-              elim4: elim4Count,
-              elim5: elim5Count,
-              elim6Plus: elim6PlusCount,
-              win: false,
-              timestamp: typeof Date.now === 'function' ? Date.now() : 0
-            };
-            saveData.gameRecords.push(recordFail);
-            saveData.updatedAt = typeof Date.now === 'function' ? Date.now() : 0;
-            saveSave(saveData);
-            if (currentUserId) {
-              dataService.saveProgress(currentUserId, {
-                maxUnlockedLevel: saveData.maxUnlockedLevel,
-                stars: saveData.stars,
-                bestScorePerLevel: saveData.bestScorePerLevel,
-                updatedAt: saveData.updatedAt
-              }, function () {});
-              dataService.submitRecord(currentUserId, recordFail, function () {});
-            }
-          }
+          pendingFailRecord = true;
           overlay = 'fail';
+          onLevelFinished(0, elim4Count + elim5Count + elim6PlusCount);
+          saveSave(saveData);
+          persistProgressToCloud();
+          rankDisplayScore = getTotalScoreForRank();
+          submitScoreForRank(getTotalScoreForRank());
+          lastMinipanelScoreSent = -1;
           playSound('fail');
         }
         render();
@@ -1649,11 +2266,24 @@ function ensureLevelMapPageInRange() {
 
 var btnRankRect = null; // 排行榜按钮（开局界面或原地图）
 var btnRankCloseRect = null; // 排行榜关闭按钮
+var btnTaskRect = null;
+var btnTaskCloseRect = null;
+var btnShareRect = null;
+var taskClaimRects = []; // { taskId, x, y, w, h }
 var RANK_PANEL_W = 300;
 var RANK_PANEL_H = 380;
+var rankTab = 'friend'; // 'friend' | 'global'
+var friendRankType = 'score'; // 'score' | 'level' | 'stars'，好友排行子类型
+var globalRankList = [];
+var globalRankLoading = false;
+var btnRankFriendRect = null;
+var btnRankGlobalRect = null;
+var btnRankScoreRect = null;
+var btnRankLevelRect = null;
+var btnRankStarsRect = null;
 
-var btnStartFrom1Rect = null;
 var btnStartContinueRect = null;
+var btnBackToMainRect = null;
 
 function renderStart() {
   var w = canvas.width;
@@ -1664,35 +2294,41 @@ function renderStart() {
     ctx.fillStyle = '#16213e';
     ctx.fillRect(0, 0, w, h);
   }
+  var staminaCur = getCurrentStamina();
+  var goldVal = saveData && typeof saveData.gold === 'number' ? saveData.gold : 0;
+  ctx.fillStyle = '#ffd93d';
+  ctx.font = '14px ' + FONT_FAMILY;
+  ctx.textAlign = 'left';
+  ctx.fillText('金币 ' + goldVal, contentX + 12, contentY + 24);
+  ctx.fillText('体力 ' + staminaCur + '/' + STAMINA_MAX, contentX + contentWidth - 80, contentY + 24);
+  ctx.textAlign = 'center';
   ctx.fillStyle = '#eee';
   ctx.font = '22px ' + FONT_FAMILY;
-  ctx.textAlign = 'center';
-  ctx.fillText('三消乐园', contentX + contentWidth / 2, contentY + 50);
+  ctx.fillText('萌兽三消', contentX + contentWidth / 2, contentY + 50);
   ctx.font = '16px ' + FONT_FAMILY;
   ctx.fillText('请选择开始方式', contentX + contentWidth / 2, contentY + 90);
+  if (staminaCur < 1) {
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.font = '12px ' + FONT_FAMILY;
+    ctx.fillText('体力不足可用' + STAMINA_GOLD_COST + '金币购买1点体力', contentX + contentWidth / 2, contentY + 108);
+  }
   var btnW = Math.min(220, contentWidth - 40);
   var btnH = 44;
   var cx = contentX + contentWidth / 2;
   var y1 = contentY + 130;
   var y2 = contentY + 130 + btnH + 16;
-  var y3 = contentY + 130 + (btnH + 16) * 2;
-  ctx.fillStyle = '#2a4a7c';
+  ctx.fillStyle = '#4a7c59';
   ctx.fillRect(cx - btnW / 2, y1, btnW, btnH);
   ctx.strokeStyle = '#4a7c9e';
   ctx.lineWidth = 2;
   ctx.strokeRect(cx - btnW / 2, y1, btnW, btnH);
   ctx.fillStyle = '#fff';
   ctx.font = '16px ' + FONT_FAMILY;
-  ctx.fillText('从第一关开始', cx, y1 + btnH / 2 + 5);
-  btnStartFrom1Rect = { x: cx - btnW / 2, y: y1, w: btnW, h: btnH };
-  ctx.fillStyle = '#4a7c59';
-  ctx.fillRect(cx - btnW / 2, y2, btnW, btnH);
-  ctx.strokeRect(cx - btnW / 2, y2, btnW, btnH);
-  ctx.fillStyle = '#fff';
-  ctx.fillText('从上次关卡继续', cx, y2 + btnH / 2 + 5);
-  btnStartContinueRect = { x: cx - btnW / 2, y: y2, w: btnW, h: btnH };
+  ctx.fillText('从上次关卡继续', cx, y1 + btnH / 2 + 5);
+  btnStartContinueRect = { x: cx - btnW / 2, y: y1, w: btnW, h: btnH };
   var rankBtnW = 120;
   var rankBtnH = 32;
+  var y3 = y1 + btnH + 16;
   ctx.fillStyle = '#6b4a7c';
   ctx.fillRect(cx - rankBtnW / 2, y3, rankBtnW, rankBtnH);
   ctx.strokeStyle = '#eee';
@@ -1701,6 +2337,20 @@ function renderStart() {
   ctx.font = '15px ' + FONT_FAMILY;
   ctx.fillText('排行榜', cx, y3 + rankBtnH / 2 + 5);
   btnRankRect = { x: cx - rankBtnW / 2, y: y3, w: rankBtnW, h: rankBtnH };
+  var y4 = y3 + rankBtnH + 12;
+  ctx.fillStyle = '#4a6b2a';
+  ctx.fillRect(cx - rankBtnW / 2, y4, rankBtnW, rankBtnH);
+  ctx.strokeRect(cx - rankBtnW / 2, y4, rankBtnW, rankBtnH);
+  ctx.fillStyle = '#fff';
+  ctx.fillText('任务', cx, y4 + rankBtnH / 2 + 5);
+  btnTaskRect = { x: cx - rankBtnW / 2, y: y4, w: rankBtnW, h: rankBtnH };
+  var y5 = y4 + rankBtnH + 12;
+  ctx.fillStyle = '#7c6b4a';
+  ctx.fillRect(cx - rankBtnW / 2, y5, rankBtnW, rankBtnH);
+  ctx.strokeRect(cx - rankBtnW / 2, y5, rankBtnW, rankBtnH);
+  ctx.fillStyle = '#fff';
+  ctx.fillText('分享', cx, y5 + rankBtnH / 2 + 5);
+  btnShareRect = { x: cx - rankBtnW / 2, y: y5, w: rankBtnW, h: rankBtnH };
 }
 
 function renderMap() {
@@ -1781,12 +2431,14 @@ function renderMap() {
 
 function openRankPanel() {
   gameScene = 'rank';
+  rankTab = 'friend';
+  friendRankType = 'score';
   try {
     var openCtx = wx.getOpenDataContext && wx.getOpenDataContext();
     if (openCtx && openCtx.canvas) {
       openCtx.canvas.width = RANK_PANEL_W;
       openCtx.canvas.height = RANK_PANEL_H;
-      openCtx.postMessage({ type: 'refresh' });
+      openCtx.postMessage({ type: 'refresh', rankType: 'score' });
     }
   } catch (e) {}
   rankLoop();
@@ -1805,12 +2457,83 @@ function renderRank() {
   ctx.strokeStyle = '#eee';
   ctx.lineWidth = 2;
   ctx.strokeRect(panelX, panelY, RANK_PANEL_W, RANK_PANEL_H);
-  try {
-    var openCtx = wx.getOpenDataContext && wx.getOpenDataContext();
-    if (openCtx && openCtx.canvas) {
-      ctx.drawImage(openCtx.canvas, 0, 0, openCtx.canvas.width || RANK_PANEL_W, openCtx.canvas.height || RANK_PANEL_H, panelX, panelY, RANK_PANEL_W, RANK_PANEL_H);
+  var tabH = 36;
+  var tabY = panelY + 4;
+  var tabW = (RANK_PANEL_W - 12) / 2;
+  ctx.fillStyle = rankTab === 'friend' ? '#4a7c59' : '#3d3d5c';
+  ctx.fillRect(panelX + 4, tabY, tabW, tabH - 4);
+  ctx.fillStyle = '#fff';
+  ctx.font = '14px ' + FONT_FAMILY;
+  ctx.textAlign = 'center';
+  ctx.fillText('好友排行', panelX + 4 + tabW / 2, tabY + (tabH - 4) / 2 + 5);
+  btnRankFriendRect = { x: panelX + 4, y: tabY, w: tabW, h: tabH - 4 };
+  ctx.fillStyle = rankTab === 'global' ? '#4a7c59' : '#3d3d5c';
+  ctx.fillRect(panelX + 8 + tabW, tabY, tabW, tabH - 4);
+  ctx.fillStyle = '#fff';
+  ctx.fillText('全球排行', panelX + 8 + tabW + tabW / 2, tabY + (tabH - 4) / 2 + 5);
+  btnRankGlobalRect = { x: panelX + 8 + tabW, y: tabY, w: tabW, h: tabH - 4 };
+  var contentTop = panelY + tabH + 4;
+  var contentH = RANK_PANEL_H - tabH - 12;
+  if (rankTab === 'friend') {
+    var subTabH = 28;
+    var subTabW = (RANK_PANEL_W - 16) / 3;
+    var subY = contentTop;
+    contentTop = subY + subTabH + 4;
+    contentH -= subTabH + 4;
+    ctx.fillStyle = friendRankType === 'score' ? '#4a7c59' : '#3d3d5c';
+    ctx.fillRect(panelX + 4, subY, subTabW, subTabH);
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px ' + FONT_FAMILY;
+    ctx.fillText('积分', panelX + 4 + subTabW / 2, subY + subTabH / 2 + 4);
+    btnRankScoreRect = { x: panelX + 4, y: subY, w: subTabW, h: subTabH };
+    ctx.fillStyle = friendRankType === 'level' ? '#4a7c59' : '#3d3d5c';
+    ctx.fillRect(panelX + 6 + subTabW, subY, subTabW, subTabH);
+    ctx.fillStyle = '#fff';
+    ctx.fillText('关卡', panelX + 6 + subTabW + subTabW / 2, subY + subTabH / 2 + 4);
+    btnRankLevelRect = { x: panelX + 6 + subTabW, y: subY, w: subTabW, h: subTabH };
+    ctx.fillStyle = friendRankType === 'stars' ? '#4a7c59' : '#3d3d5c';
+    ctx.fillRect(panelX + 8 + subTabW * 2, subY, subTabW, subTabH);
+    ctx.fillStyle = '#fff';
+    ctx.fillText('星级', panelX + 8 + subTabW * 2 + subTabW / 2, subY + subTabH / 2 + 4);
+    btnRankStarsRect = { x: panelX + 8 + subTabW * 2, y: subY, w: subTabW, h: subTabH };
+    try {
+      var openCtx = wx.getOpenDataContext && wx.getOpenDataContext();
+      if (openCtx && openCtx.canvas) {
+        ctx.drawImage(openCtx.canvas, 0, 0, openCtx.canvas.width || RANK_PANEL_W, openCtx.canvas.height || RANK_PANEL_H, panelX, contentTop, RANK_PANEL_W, contentH);
+      }
+    } catch (e) {}
+  } else {
+    btnRankScoreRect = null;
+    btnRankLevelRect = null;
+    btnRankStarsRect = null;
+    ctx.fillStyle = '#16213e';
+    ctx.fillRect(panelX + 4, contentTop, RANK_PANEL_W - 8, contentH);
+    if (globalRankLoading) {
+      ctx.fillStyle = '#eee';
+      ctx.font = '14px ' + FONT_FAMILY;
+      ctx.textAlign = 'center';
+      ctx.fillText('加载中…', panelX + RANK_PANEL_W / 2, contentTop + contentH / 2 - 8);
+    } else if (globalRankList.length === 0) {
+      ctx.fillStyle = '#aaa';
+      ctx.font = '14px ' + FONT_FAMILY;
+      ctx.textAlign = 'center';
+      ctx.fillText('暂无全球排行数据', panelX + RANK_PANEL_W / 2, contentTop + contentH / 2 - 8);
+    } else {
+      var lineH = 28;
+      var left = panelX + 12;
+      var right = panelX + RANK_PANEL_W - 12;
+      for (var i = 0; i < globalRankList.length && (contentTop + 20 + (i + 1) * lineH) <= panelY + RANK_PANEL_H - 8; i++) {
+        var item = globalRankList[i];
+        var y = contentTop + 16 + i * lineH;
+        ctx.fillStyle = '#fff';
+        ctx.font = '13px ' + FONT_FAMILY;
+        ctx.textAlign = 'left';
+        ctx.fillText('第' + (item.rank || (i + 1)) + '名', left, y + 16);
+        ctx.textAlign = 'right';
+        ctx.fillText(String(item.totalScore != null ? item.totalScore : 0), right, y + 16);
+      }
     }
-  } catch (e) {}
+  }
   var closeW = 100;
   var closeH = 36;
   var closeX = contentX + (contentWidth - closeW) / 2;
@@ -1828,6 +2551,93 @@ function rankLoop() {
   if (gameScene !== 'rank') return;
   renderRank();
   requestAnimationFrame(rankLoop);
+}
+
+function renderTasks() {
+  taskClaimRects = [];
+  var w = canvas.width;
+  var h = canvas.height;
+  if (bgImage && bgImage.width > 0 && bgImage.height > 0) {
+    ctx.drawImage(bgImage, 0, 0, w, h);
+  } else {
+    ctx.fillStyle = '#16213e';
+    ctx.fillRect(0, 0, w, h);
+  }
+  ctx.fillStyle = '#eee';
+  ctx.font = '20px ' + FONT_FAMILY;
+  ctx.textAlign = 'center';
+  ctx.fillText('任务', contentX + contentWidth / 2, contentY + 28);
+  var left = contentX + 12;
+  var rowH = 56;
+  var y = contentY + 44;
+  var now = typeof Date.now === 'function' ? Date.now() : 0;
+
+  function drawTaskList(list, title) {
+    ctx.fillStyle = '#aaa';
+    ctx.font = '14px ' + FONT_FAMILY;
+    ctx.textAlign = 'left';
+    ctx.fillText(title, left, y);
+    y += 22;
+    for (var i = 0; i < list.length; i++) {
+      var task = list[i];
+      var tid = task.id;
+      var prog = saveData && saveData.taskProgress ? saveData.taskProgress[tid] : null;
+      if (!prog) prog = { status: 'locked', progress: 0 };
+      if (prog.status === 'unlocked' && !prog.firstViewedAt) {
+        saveData.taskProgress[tid] = saveData.taskProgress[tid] || {};
+        saveData.taskProgress[tid].firstViewedAt = now;
+        recordTaskEvent(tid, 'first_view', {});
+      }
+      var target = (task.objective && task.objective.target) || 1;
+      var progressVal = prog.progress || 0;
+      var statusText = prog.status === 'locked' ? '未解锁' : prog.status === 'unlocked' ? '进行中' : prog.status === 'completed' ? '可领取' : '已领取';
+      ctx.fillStyle = prog.status === 'locked' ? '#666' : '#eee';
+      ctx.font = '14px ' + FONT_FAMILY;
+      ctx.fillText(task.name + ' ' + progressVal + '/' + target + ' ' + statusText, left, y + 14);
+      ctx.font = '12px ' + FONT_FAMILY;
+      ctx.fillStyle = '#aaa';
+      ctx.fillText(task.desc + '  奖励: ' + (task.rewardGold || 0) + '金' + ((task.rewardStamina || 0) > 0 ? ' +' + task.rewardStamina + '体力' : ''), left, y + 30);
+      if (prog.status === 'completed') {
+        var claimW = 56;
+        var claimH = 28;
+        var claimX = contentX + contentWidth - 12 - claimW;
+        var claimY = y + 4;
+        ctx.fillStyle = '#4a7c59';
+        ctx.fillRect(claimX, claimY, claimW, claimH);
+        ctx.fillStyle = '#fff';
+        ctx.font = '13px ' + FONT_FAMILY;
+        ctx.textAlign = 'center';
+        ctx.fillText('领取', claimX + claimW / 2, claimY + claimH / 2 + 5);
+        ctx.textAlign = 'left';
+        taskClaimRects.push({ taskId: tid, x: claimX, y: claimY, w: claimW, h: claimH });
+      }
+      y += rowH;
+    }
+    y += 12;
+  }
+
+  var dailyTasks = TASK_CONFIG.filter(function (t) { return t.type === 'daily'; });
+  var weeklyTasks = TASK_CONFIG.filter(function (t) { return t.type === 'weekly'; });
+  drawTaskList(dailyTasks, '每日任务');
+  drawTaskList(weeklyTasks, '每周任务');
+
+  var closeW = 100;
+  var closeH = 36;
+  var closeX = contentX + (contentWidth - closeW) / 2;
+  var closeY = contentY + contentHeight - closeH - 24;
+  ctx.fillStyle = '#5c5c8a';
+  ctx.fillRect(closeX, closeY, closeW, closeH);
+  ctx.fillStyle = '#fff';
+  ctx.font = '16px ' + FONT_FAMILY;
+  ctx.textAlign = 'center';
+  ctx.fillText('返回', contentX + contentWidth / 2, closeY + closeH / 2 + 6);
+  btnTaskCloseRect = { x: closeX, y: closeY, w: closeW, h: closeH };
+}
+
+function tasksLoop() {
+  if (gameScene !== 'tasks') return;
+  renderTasks();
+  requestAnimationFrame(tasksLoop);
 }
 
 function render() {
@@ -1861,10 +2671,15 @@ function render() {
   ctx.fillStyle = '#eee';
   ctx.font = '13px ' + FONT_FAMILY;
   ctx.textAlign = 'left';
-  ctx.fillText('步数: ' + movesLeft, hudLeft, hudY);
+  ctx.fillText('关卡 ' + (currentLevelId || 1), hudLeft, hudY);
+  ctx.fillText('步数: ' + movesLeft, hudLeft, hudY + lineH);
+  if (saveData && typeof saveData.gold === 'number') {
+    ctx.fillText('金币: ' + saveData.gold, hudLeft, hudY + lineH * 2);
+  }
+  var goalOffset = (saveData && typeof saveData.gold === 'number') ? 3 : 2;
   for (var i = 0; i < currentGoals.length; i++) {
     var goal = currentGoals[i];
-    var y = hudY + (i + 1) * lineH;
+    var y = hudY + (i + goalOffset) * lineH;
     if (goal.type === 'score') {
       ctx.fillStyle = '#eee';
       ctx.fillText('分数: ' + score + ' / ' + goal.value, hudLeft, y);
@@ -1875,12 +2690,44 @@ function render() {
       ctx.fillText(name + ': ' + prog + ' / ' + goal.amount, hudLeft, y);
     }
   }
+  if (gameScene === 'play' && saveData && saveData.taskProgress) {
+    var taskParts = [];
+    for (var ti = 0; ti < TASK_CONFIG.length; ti++) {
+      var t = TASK_CONFIG[ti];
+      var prog = saveData.taskProgress[t.id] || {};
+      if (prog.status === 'locked' || prog.status === 'claimed') continue;
+      var target = (t.objective && t.objective.target) || 1;
+      var p = prog.progress || 0;
+      taskParts.push(t.name + ' ' + p + '/' + target);
+    }
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.font = '11px ' + FONT_FAMILY;
+    ctx.fillText(taskParts.length ? taskParts.join('  ') : '任务', hudLeft, hudY + (currentGoals.length + goalOffset) * lineH);
+    var fourCount = elim4Count + elim5Count + elim6PlusCount;
+    var today = getDateKey();
+    var fourClaimedToday = (saveData.fourMatchGoldClaimedDate === today) ? (saveData.fourMatchGoldClaimedToday || 0) : 0;
+    if (fourClaimedToday >= 5) {
+      ctx.fillText('今日四连50金已领满', hudLeft, hudY + (currentGoals.length + goalOffset + 1) * lineH);
+    } else {
+      var fourGoldByRule = Math.floor(fourCount / 5) * 50;
+      var fourLine1 = '本局四连: ' + fourCount + '  每5次四连奖50金(今日已领' + fourClaimedToday + '/5)';
+      var fourLine2 = '本局四连可得金币: ' + fourGoldByRule;
+      ctx.fillText(fourLine1, hudLeft, hudY + (currentGoals.length + goalOffset + 1) * lineH);
+      ctx.fillText(fourLine2, hudLeft, hudY + (currentGoals.length + goalOffset + 2) * lineH);
+    }
+  }
   ctx.fillStyle = '#eee';
-  var potentialTotal = getPotentialTotalScoreForRank();
+  var potentialTotal = (gameScene === 'play') ? rankDisplayScore : getPotentialTotalScoreForRank();
   var rankPanelX = contentX + contentWidth - MINIPANEL_W - Math.max(RANK_PANEL_RIGHT_MARGIN, safeInsetRight + 16);
   var rankPanelY = contentY + Math.max(8, safeInsetTop + 4);
   var rankPanelTotalH = MINIPANEL_H + RANK_PANEL_EXTRA;
   if (gameScene === 'play') {
+    var staminaCurPlay = getCurrentStamina();
+    ctx.fillStyle = 'rgba(255,255,255,0.95)';
+    ctx.font = '12px ' + FONT_FAMILY;
+    ctx.textAlign = 'right';
+    ctx.fillText('体力 ' + staminaCurPlay + '/' + STAMINA_MAX, rankPanelX + MINIPANEL_W, rankPanelY - 4);
+    ctx.textAlign = 'left';
     ctx.fillStyle = 'rgba(22,33,62,0.92)';
     ctx.fillRect(rankPanelX, rankPanelY, MINIPANEL_W, rankPanelTotalH);
     ctx.strokeStyle = '#4a7c9e';
@@ -1954,10 +2801,40 @@ function render() {
           ctx.fillRect(x + pad, y + pad, cellSize - pad * 2, cellSize - pad * 2);
           ctx.restore();
         }
+        if (iceGrid[r] && iceGrid[r][c] > 0) {
+          ctx.save();
+          ctx.globalAlpha = 0.5;
+          ctx.fillStyle = 'rgba(200,230,255,0.7)';
+          var box = cellSize - pad * 2;
+          var cr = Math.max(2, Math.min(box / 5, 6));
+          roundRectPath(ctx, x + pad, y + pad, box, box, cr);
+          ctx.fill();
+          ctx.restore();
+        }
       } else if ((grid[r][c] === LINE_H || grid[r][c] === LINE_V || grid[r][c] === BOMB) && !isFilling) {
         drawSpecialBlock(x + pad, y + pad, cellSize - pad * 2, grid[r][c]);
       }
     }
+  }
+
+  if (gameScene === 'play') {
+    var backBtnW = 120;
+    var backBtnH = 36;
+    var backX = contentX + (contentWidth - backBtnW) / 2;
+    var backY = contentY + contentHeight - backBtnH - 20;
+    ctx.fillStyle = 'rgba(92,92,138,0.9)';
+    ctx.fillRect(backX, backY, backBtnW, backBtnH);
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(backX, backY, backBtnW, backBtnH);
+    ctx.fillStyle = '#fff';
+    ctx.font = '14px ' + FONT_FAMILY;
+    ctx.textAlign = 'center';
+    ctx.fillText('返回主菜单', backX + backBtnW / 2, backY + backBtnH / 2 + 5);
+    ctx.textAlign = 'left';
+    btnBackToMainRect = { x: backX, y: backY, w: backBtnW, h: backBtnH };
+  } else {
+    btnBackToMainRect = null;
   }
 
   if (eliminateAnim && eliminateAnim.progress < 0.4 && eliminateAnim.matches.length > 0) {
@@ -2212,7 +3089,7 @@ function render() {
     ctx.fillStyle = 'rgba(0,0,0,0.6)';
     ctx.fillRect(0, 0, w, h);
     var panelW = 220;
-    var panelH = overlay === 'win' ? 218 : 130;
+    var panelH = overlay === 'win' ? 218 : 170;
     var panelX = contentX + (contentWidth - panelW) / 2;
     var panelY = contentY + (contentHeight - panelH) / 2;
     ctx.fillStyle = '#2a2a4a';
@@ -2247,10 +3124,27 @@ function render() {
     ctx.fillStyle = '#fff';
     ctx.font = '16px ' + FONT_FAMILY;
     ctx.fillText(overlay === 'win' ? '下一关' : '重试', contentX + contentWidth / 2, btnY + 24);
-    var btnMapY = overlay === 'win' ? panelY + 168 : panelY + 92;
+    var btnMapY;
+    if (overlay === 'fail') {
+      var buyBtnW = 130;
+      var buyBtnH = 26;
+      var buyBtnX = (w - buyBtnW) / 2;
+      var buyBtnY = panelY + 94;
+      ctx.fillStyle = '#5c5c7a';
+      ctx.fillRect(buyBtnX, buyBtnY, buyBtnW, buyBtnH);
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.font = '12px ' + FONT_FAMILY;
+      ctx.fillText('50金币购买3步', contentX + contentWidth / 2, buyBtnY + buyBtnH / 2 + 4);
+      btnBuyStepsRect = { x: buyBtnX, y: buyBtnY, w: buyBtnW, h: buyBtnH };
+      btnMapY = panelY + 126;
+    } else {
+      btnBuyStepsRect = null;
+      btnMapY = panelY + 168;
+    }
     ctx.fillStyle = '#5c5c8a';
     ctx.fillRect(btnX, btnMapY, btnW, btnH);
     ctx.fillStyle = '#fff';
+    ctx.font = '16px ' + FONT_FAMILY;
     ctx.fillText('返回', contentX + contentWidth / 2, btnMapY + 24);
     btnMapRect = { x: btnX, y: btnMapY, w: btnW, h: btnH };
     if (overlay === 'win') {
@@ -2263,9 +3157,10 @@ function render() {
   } else {
     btnNextRect = null;
     btnRetryRect = null;
+    btnBuyStepsRect = null;
     btnMapRect = null;
   }
-  // 对局中且无结算遮罩时，在最后一笔再绘一次排名面板，保证始终在最上层且使用最新 sharedCanvas
+  // 对局中且无结算遮罩时，在最后一笔再绘一次排名面板，保证始终在最上层且使用最新 sharedCanvas（对局中不刷新得分，仅用 rankDisplayScore）
   if (gameScene === 'play' && overlay !== 'win' && overlay !== 'fail') {
     try {
       var openCtxLast = wx.getOpenDataContext && wx.getOpenDataContext();
@@ -2273,7 +3168,7 @@ function render() {
         if (openCtxLast.canvas.width !== MINIPANEL_W || openCtxLast.canvas.height !== MINIPANEL_H) {
           openCtxLast.canvas.width = MINIPANEL_W;
           openCtxLast.canvas.height = MINIPANEL_H;
-          openCtxLast.postMessage({ type: 'minipanel', score: Math.floor(getPotentialTotalScoreForRank()) });
+          openCtxLast.postMessage({ type: 'minipanel', score: Math.floor(rankDisplayScore) });
         }
         if (openCtxLast.canvas.width === MINIPANEL_W) {
           ctx.drawImage(openCtxLast.canvas, 0, 0, MINIPANEL_W, MINIPANEL_H, rankPanelX, rankPanelY, MINIPANEL_W, MINIPANEL_H);
@@ -2305,24 +3200,70 @@ function main() {
   }
   bindTouch();
   saveData = loadSave();
+  resetDailyWeeklyIfNeeded();
+  rankDisplayScore = getTotalScoreForRank();
+  if (typeof wx !== 'undefined' && wx.setUserCloudStorage) submitScoreForRank(getTotalScoreForRank());
   gameScene = 'start';
   renderStart();
   if (typeof wx !== 'undefined' && wx.cloud && CLOUD_ENV) {
     dataService.ensureUser(function (res) {
       if (!res.ok || !res.userId) return;
       currentUserId = res.userId;
+      persistProgressToCloud();
+      if (currentUserId && typeof dataService.submitGlobalRank === 'function') {
+        dataService.submitGlobalRank(currentUserId, getTotalScoreForRank(), function () {});
+      }
       dataService.getProgress(currentUserId, function (prog) {
         if (!prog.ok || !prog.data) return;
         var cloudData = prog.data;
         var localUpdated = (saveData && saveData.updatedAt) ? saveData.updatedAt : 0;
         var cloudUpdated = (cloudData && cloudData.updatedAt) ? cloudData.updatedAt : 0;
-        if (cloudUpdated >= localUpdated && cloudData.maxUnlockedLevel != null) {
+        var localGold = (saveData && typeof saveData.gold === 'number') ? saveData.gold : 0;
+        var cloudGold = typeof cloudData.gold === 'number' ? cloudData.gold : 0;
+        var doFullMerge = cloudUpdated >= localUpdated && cloudData.maxUnlockedLevel != null;
+        var doRecoveryMerge = !doFullMerge && localGold === 0 && cloudGold > 0;
+        if (doFullMerge) {
           saveData = saveData || getDefaultSave();
           saveData.maxUnlockedLevel = cloudData.maxUnlockedLevel;
           if (cloudData.stars && typeof cloudData.stars === 'object') saveData.stars = cloudData.stars;
           if (cloudData.bestScorePerLevel && typeof cloudData.bestScorePerLevel === 'object') saveData.bestScorePerLevel = cloudData.bestScorePerLevel;
           saveData.updatedAt = cloudUpdated;
+          if (typeof cloudData.gold === 'number') saveData.gold = cloudData.gold;
+          if (typeof cloudData.stamina === 'number') saveData.stamina = cloudData.stamina;
+          if (typeof cloudData.lastStaminaTime === 'number') saveData.lastStaminaTime = cloudData.lastStaminaTime;
+          if (cloudData.taskProgress && typeof cloudData.taskProgress === 'object') saveData.taskProgress = cloudData.taskProgress;
+          if (Array.isArray(cloudData.taskEvents)) saveData.taskEvents = cloudData.taskEvents;
+          if (typeof cloudData.lastDailyReset === 'string') saveData.lastDailyReset = cloudData.lastDailyReset;
+          if (typeof cloudData.lastWeeklyReset === 'string') saveData.lastWeeklyReset = cloudData.lastWeeklyReset;
+          if (typeof cloudData.sessionActive === 'boolean') saveData.sessionActive = cloudData.sessionActive;
+          if (typeof cloudData.resumableLevelId === 'number') saveData.resumableLevelId = cloudData.resumableLevelId;
+          if (cloudData.levelStuckCount && typeof cloudData.levelStuckCount === 'object') saveData.levelStuckCount = cloudData.levelStuckCount;
+          if (cloudData.levelAdjustments && typeof cloudData.levelAdjustments === 'object') saveData.levelAdjustments = cloudData.levelAdjustments;
+          if (typeof cloudData.fourMatchRewardCounter === 'number') saveData.fourMatchRewardCounter = cloudData.fourMatchRewardCounter;
+          if (typeof cloudData.fourMatchGoldClaimedDate === 'string') saveData.fourMatchGoldClaimedDate = cloudData.fourMatchGoldClaimedDate;
+          if (typeof cloudData.fourMatchGoldClaimedToday === 'number') saveData.fourMatchGoldClaimedToday = cloudData.fourMatchGoldClaimedToday;
           saveSave(saveData);
+          rankDisplayScore = getTotalScoreForRank();
+          if (currentUserId && typeof dataService.submitGlobalRank === 'function') {
+            dataService.submitGlobalRank(currentUserId, getTotalScoreForRank(), function () {});
+          }
+          renderStart();
+        } else if (doRecoveryMerge) {
+          saveData = saveData || getDefaultSave();
+          if (typeof cloudData.gold === 'number') saveData.gold = cloudData.gold;
+          if (typeof cloudData.stamina === 'number') saveData.stamina = cloudData.stamina;
+          if (typeof cloudData.lastStaminaTime === 'number') saveData.lastStaminaTime = cloudData.lastStaminaTime;
+          if (cloudData.taskProgress && typeof cloudData.taskProgress === 'object') saveData.taskProgress = cloudData.taskProgress;
+          if (Array.isArray(cloudData.taskEvents)) saveData.taskEvents = cloudData.taskEvents;
+          if (typeof cloudData.fourMatchRewardCounter === 'number') saveData.fourMatchRewardCounter = cloudData.fourMatchRewardCounter;
+          if (typeof cloudData.fourMatchGoldClaimedDate === 'string') saveData.fourMatchGoldClaimedDate = cloudData.fourMatchGoldClaimedDate;
+          if (typeof cloudData.fourMatchGoldClaimedToday === 'number') saveData.fourMatchGoldClaimedToday = cloudData.fourMatchGoldClaimedToday;
+          if (cloudData.maxUnlockedLevel != null) saveData.maxUnlockedLevel = cloudData.maxUnlockedLevel;
+          if (cloudData.stars && typeof cloudData.stars === 'object') saveData.stars = cloudData.stars;
+          if (cloudData.bestScorePerLevel && typeof cloudData.bestScorePerLevel === 'object') saveData.bestScorePerLevel = cloudData.bestScorePerLevel;
+          saveData.updatedAt = Math.max(localUpdated, cloudUpdated);
+          saveSave(saveData);
+          rankDisplayScore = getTotalScoreForRank();
           renderStart();
         }
       });
@@ -2332,10 +3273,20 @@ function main() {
     try {
       wx.showShareMenu && wx.showShareMenu({ withShareTimeline: true });
       wx.onShareAppMessage && wx.onShareAppMessage(function () {
-        return { title: '三消乐园', imageUrl: lastShareImagePath || '' };
+        shareIntentTime = Date.now();
+        shareTaskCountedThisSession = false;
+        return { title: '萌兽三消', imageUrl: lastShareImagePath || '' };
       });
       wx.onShareTimeline && wx.onShareTimeline(function () {
-        return { title: '三消乐园', imageUrl: lastShareImagePath || '' };
+        return { title: '萌兽三消', imageUrl: lastShareImagePath || '' };
+      });
+      // 分享任务回退：微信部分场景下 shareAppMessage 的 success 不触发，用户从分享返回时视为完成一次分享
+      wx.onShow && wx.onShow(function () {
+        if (shareIntentTime > 0 && (Date.now() - shareIntentTime) < 120000 && !shareTaskCountedThisSession) {
+          tryCountShareTask();
+        }
+        shareIntentTime = 0;
+        if (gameScene === 'start') renderStart();
       });
     } catch (e) {}
   }
