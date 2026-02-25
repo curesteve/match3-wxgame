@@ -1,0 +1,9 @@
+{
+  "triggers": [
+    {
+      "name": "dailySettle",
+      "type": "timer",
+      "config": "0 5 0 * * * *"
+    }
+  ]
+}

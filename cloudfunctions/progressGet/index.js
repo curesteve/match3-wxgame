@@ -58,10 +58,18 @@ exports.main = async (event, context) => {
     if (!userId) return { ok: false, message: 'no userId' };
     const col = db.collection('game_save');
     const res = await col.where({ userId: userId }).get();
-    if (res.data && res.data.length > 0) {
-      return { ok: true, data: getDataFromDoc(res.data[0]) };
+    let data = res.data && res.data.length > 0 ? getDataFromDoc(res.data[0]) : getDefaultSave();
+    const settleCol = db.collection('rank_settlements');
+    const unclaimed = await settleCol.where({ userId: userId, claimed: false }).get();
+    if (unclaimed.data && unclaimed.data.length > 0) {
+      let extraGold = 0;
+      for (let i = 0; i < unclaimed.data.length; i++) {
+        extraGold += unclaimed.data[i].goldGranted != null ? unclaimed.data[i].goldGranted : 0;
+        await settleCol.doc(unclaimed.data[i]._id).update({ data: { claimed: true } });
+      }
+      data.gold = (typeof data.gold === 'number' ? data.gold : 0) + extraGold;
     }
-    return { ok: true, data: getDefaultSave() };
+    return { ok: true, data: data };
   } catch (e) {
     return { ok: false, message: e.message };
   }

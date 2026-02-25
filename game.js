@@ -8,6 +8,7 @@ var GAME_VERSION = 'M1';
 // 云开发持久化：环境 ID，开通云开发后替换为你的环境 ID；空字符串则不同步云端
 var CLOUD_ENV = 'cloud1-8gebksxb1f687118';
 var currentUserId = null;
+var userNickName = '';
 var dataService = {
   ensureUser: function (cb) {
     if (typeof wx === 'undefined' || !wx.cloud || !wx.cloud.callFunction || !CLOUD_ENV) { if (cb) cb({ ok: false }); return; }
@@ -37,21 +38,43 @@ var dataService = {
       if (cb) cb(result && result.ok ? result : { ok: false });
     }).catch(function () { if (cb) cb({ ok: false }); });
   },
-  submitGlobalRank: function (userId, totalScore, cb) {
+  submitGlobalRank: function (userId, totalScore, cb, nickName) {
     if (typeof wx === 'undefined' || !wx.cloud || !wx.cloud.callFunction || !CLOUD_ENV || !userId) { if (cb) cb({ ok: false }); return; }
-    wx.cloud.callFunction({ name: 'rankSubmit', data: { userId: userId, totalScore: totalScore } }).then(function (res) {
+    var data = { userId: userId, totalScore: totalScore };
+    if (nickName) data.nickName = nickName;
+    wx.cloud.callFunction({ name: 'rankSubmit', data: data }).then(function (res) {
       var result = res.result;
       if (cb) cb(result && result.ok ? result : { ok: false });
     }).catch(function () { if (cb) cb({ ok: false }); });
   },
-  getGlobalRank: function (cb) {
+  getGlobalRank: function (cb, periodType, periodKey, userId) {
     if (typeof wx === 'undefined' || !wx.cloud || !wx.cloud.callFunction || !CLOUD_ENV) { if (cb) cb({ ok: false, list: [] }); return; }
-    wx.cloud.callFunction({ name: 'rankList', data: { limit: 50 } }).then(function (res) {
+    var keys = getPeriodKeysInBeijing();
+    var pt = periodType || 'day';
+    var pk = periodKey || keys[pt];
+    wx.cloud.callFunction({ name: 'rankList', data: { limit: 50, periodType: pt, periodKey: pk, userId: userId || null } }).then(function (res) {
       var result = res.result;
-      if (cb) cb(result && result.ok ? { ok: true, list: result.list || [] } : { ok: false, list: [] });
+      if (cb) cb(result && result.ok ? { ok: true, list: result.list || [], myRank: result.myRank || null } : { ok: false, list: [] });
     }).catch(function () { if (cb) cb({ ok: false, list: [] }); });
   }
 };
+
+/** 北京时间 UTC+8 下的当日、当周、当月 periodKey（与云端约定一致） */
+function getPeriodKeysInBeijing() {
+  var bj = new Date(Date.now() + 8 * 3600 * 1000);
+  var y = bj.getUTCFullYear();
+  var m = bj.getUTCMonth();
+  var d = bj.getUTCDate();
+  function pad2(n) { return n < 10 ? '0' + n : String(n); }
+  var dayKey = y + '-' + pad2(m + 1) + '-' + pad2(d);
+  var monthKey = y + '-' + pad2(m + 1);
+  var dayOfWeek = (bj.getUTCDay() + 6) % 7;
+  var monday = new Date(Date.UTC(y, m, d - dayOfWeek));
+  var jan1 = new Date(Date.UTC(y, 0, 1));
+  var weekNum = Math.floor((monday - jan1) / (7 * 86400000)) + 1;
+  var weekKey = y + '-W' + pad2(weekNum);
+  return { day: dayKey, week: weekKey, month: monthKey };
+}
 
 const COLS = 8;
 const ROWS = 8;
@@ -108,7 +131,13 @@ let touchStartY = 0;
 
 const MIN_SWIPE_PX = 18; // 最小滑动距离（像素），小于则视为点击忽略
 
-// 无限关卡模式：难度由「过关积分/步数」与「色块数量/步数」共同控制；每三关出现一关含色块消除
+/**
+ * 关卡仅由公式生成，无静态配置文件。
+ * 难度三要素（均可在本函数内调参）：
+ * - 过关分数 targetScore = 350 + levelId * 75
+ * - 步数 moves = max(8, 20 - floor(levelId/3))
+ * - 特定色块数量比例：levelId % 3 === 0 时增加收集目标，collectPerMove = 0.35 + levelId*0.015，maxCollect 由步数与比例算出，各颜色按比例分配
+ */
 function generateLevelConfig(levelId) {
   if (levelId < 1) return null;
   var d = levelId; // 综合难度指数
@@ -1425,44 +1454,65 @@ function onTouchEnd(e) {
     }
     if (btnRankFriendRect && endX >= btnRankFriendRect.x && endX <= btnRankFriendRect.x + btnRankFriendRect.w && endY >= btnRankFriendRect.y && endY <= btnRankFriendRect.y + btnRankFriendRect.h) {
       rankTab = 'friend';
+      try {
+        var ocFriend = wx.getOpenDataContext && wx.getOpenDataContext();
+        if (ocFriend && ocFriend.canvas) {
+          var keysFriend = getPeriodKeysInBeijing();
+          ocFriend.postMessage({ type: 'refresh', periodType: rankPeriod, periodKey: keysFriend[rankPeriod], env: CLOUD_ENV });
+        }
+      } catch (e) {}
       return;
     }
     if (btnRankGlobalRect && endX >= btnRankGlobalRect.x && endX <= btnRankGlobalRect.x + btnRankGlobalRect.w && endY >= btnRankGlobalRect.y && endY <= btnRankGlobalRect.y + btnRankGlobalRect.h) {
       rankTab = 'global';
-      if (globalRankList.length === 0 && !globalRankLoading && typeof dataService !== 'undefined' && dataService.getGlobalRank) {
+      if (!globalRankLoading && typeof dataService !== 'undefined' && dataService.getGlobalRank) {
         globalRankLoading = true;
+        globalRankList = [];
+        globalRankMyRank = null;
+        var keys = getPeriodKeysInBeijing();
         dataService.getGlobalRank(function (res) {
           globalRankLoading = false;
           globalRankList = (res && res.list) ? res.list : [];
-        });
+          globalRankMyRank = (res && res.myRank) ? res.myRank : null;
+        }, rankPeriod, keys[rankPeriod], currentUserId);
       }
       return;
     }
-    if (rankTab === 'friend') {
-      if (btnRankScoreRect && endX >= btnRankScoreRect.x && endX <= btnRankScoreRect.x + btnRankScoreRect.w && endY >= btnRankScoreRect.y && endY <= btnRankScoreRect.y + btnRankScoreRect.h) {
-        friendRankType = 'score';
+    if (rankTab === 'global' && (btnRankDayRect || btnRankWeekRect || btnRankMonthRect)) {
+      var newPeriod = null;
+      if (btnRankDayRect && endX >= btnRankDayRect.x && endX <= btnRankDayRect.x + btnRankDayRect.w && endY >= btnRankDayRect.y && endY <= btnRankDayRect.y + btnRankDayRect.h) newPeriod = 'day';
+      if (btnRankWeekRect && endX >= btnRankWeekRect.x && endX <= btnRankWeekRect.x + btnRankWeekRect.w && endY >= btnRankWeekRect.y && endY <= btnRankWeekRect.y + btnRankWeekRect.h) newPeriod = 'week';
+      if (btnRankMonthRect && endX >= btnRankMonthRect.x && endX <= btnRankMonthRect.x + btnRankMonthRect.w && endY >= btnRankMonthRect.y && endY <= btnRankMonthRect.y + btnRankMonthRect.h) newPeriod = 'month';
+      if (newPeriod && newPeriod !== rankPeriod && typeof dataService !== 'undefined' && dataService.getGlobalRank) {
+        rankPeriod = newPeriod;
+        globalRankLoading = true;
+        globalRankList = [];
+        globalRankMyRank = null;
+        var keys2 = getPeriodKeysInBeijing();
+        dataService.getGlobalRank(function (res) {
+          globalRankLoading = false;
+          globalRankList = (res && res.list) ? res.list : [];
+          globalRankMyRank = (res && res.myRank) ? res.myRank : null;
+        }, rankPeriod, keys2[rankPeriod], currentUserId);
+      }
+      return;
+    }
+    if (rankTab === 'friend' && (btnRankScoreRect || btnRankLevelRect || btnRankStarsRect)) {
+      var newPeriod = null;
+      if (btnRankScoreRect && endX >= btnRankScoreRect.x && endX <= btnRankScoreRect.x + btnRankScoreRect.w && endY >= btnRankScoreRect.y && endY <= btnRankScoreRect.y + btnRankScoreRect.h) newPeriod = 'day';
+      if (btnRankLevelRect && endX >= btnRankLevelRect.x && endX <= btnRankLevelRect.x + btnRankLevelRect.w && endY >= btnRankLevelRect.y && endY <= btnRankLevelRect.y + btnRankLevelRect.h) newPeriod = 'week';
+      if (btnRankStarsRect && endX >= btnRankStarsRect.x && endX <= btnRankStarsRect.x + btnRankStarsRect.w && endY >= btnRankStarsRect.y && endY <= btnRankStarsRect.y + btnRankStarsRect.h) newPeriod = 'month';
+      if (newPeriod && newPeriod !== rankPeriod) {
+        rankPeriod = newPeriod;
         try {
           var oc = wx.getOpenDataContext && wx.getOpenDataContext();
-          if (oc) oc.postMessage({ type: 'refresh', rankType: 'score' });
+          if (oc) {
+            var keys = getPeriodKeysInBeijing();
+            oc.postMessage({ type: 'refresh', periodType: rankPeriod, periodKey: keys[rankPeriod], env: CLOUD_ENV });
+          }
         } catch (e) {}
-        return;
       }
-      if (btnRankLevelRect && endX >= btnRankLevelRect.x && endX <= btnRankLevelRect.x + btnRankLevelRect.w && endY >= btnRankLevelRect.y && endY <= btnRankLevelRect.y + btnRankLevelRect.h) {
-        friendRankType = 'level';
-        try {
-          var oc2 = wx.getOpenDataContext && wx.getOpenDataContext();
-          if (oc2) oc2.postMessage({ type: 'refresh', rankType: 'level' });
-        } catch (e) {}
-        return;
-      }
-      if (btnRankStarsRect && endX >= btnRankStarsRect.x && endX <= btnRankStarsRect.x + btnRankStarsRect.w && endY >= btnRankStarsRect.y && endY <= btnRankStarsRect.y + btnRankStarsRect.h) {
-        friendRankType = 'stars';
-        try {
-          var oc3 = wx.getOpenDataContext && wx.getOpenDataContext();
-          if (oc3) oc3.postMessage({ type: 'refresh', rankType: 'stars' });
-        } catch (e) {}
-        return;
-      }
+      return;
     }
     return;
   }
@@ -1816,7 +1866,7 @@ function gameLoop(now) {
             rankDisplayScore = getTotalScoreForRank();
             lastMinipanelScoreSent = -1;
             if (currentUserId && typeof dataService !== 'undefined' && dataService.submitGlobalRank) {
-              dataService.submitGlobalRank(currentUserId, getTotalScoreForRank(), function () {});
+              dataService.submitGlobalRank(currentUserId, getTotalScoreForRank(), function () {}, userNickName);
             }
           }
           overlay = 'win';
@@ -2242,29 +2292,7 @@ function getEliminateScale(p) {
   return 1.35 - (p - 0.2) / 0.7 * 1.35;
 }
 
-// 阶段五：关卡选择地图（无限关卡，每页 20 关，分页）
-var MAP_TOP = 50;
-var MAP_COLS = 5;
-var MAP_ROWS = 4;
-var LEVELS_PER_PAGE = MAP_COLS * MAP_ROWS; // 20
-var MAP_BOTTOM = 88;
-var levelMapPage = 0; // 当前页码，0 起
-var btnMapPrevRect = null;
-var btnMapNextRect = null;
-function getMapTouchLevel(clientX, clientY) {
-  var cellW = contentWidth / MAP_COLS;
-  var cellH = (contentHeight - MAP_TOP - MAP_BOTTOM) / MAP_ROWS;
-  if (clientY < contentY + MAP_TOP) return null;
-  var row = Math.floor((clientY - contentY - MAP_TOP) / cellH);
-  var col = Math.floor((clientX - contentX) / cellW);
-  if (row < 0 || row >= MAP_ROWS || col < 0 || col >= MAP_COLS) return null;
-  return levelMapPage * LEVELS_PER_PAGE + row * MAP_COLS + col + 1;
-}
-function ensureLevelMapPageInRange() {
-  if (levelMapPage < 0) levelMapPage = 0;
-}
-
-var btnRankRect = null; // 排行榜按钮（开局界面或原地图）
+var btnRankRect = null; // 排行榜按钮（开局界面）
 var btnRankCloseRect = null; // 排行榜关闭按钮
 var btnTaskRect = null;
 var btnTaskCloseRect = null;
@@ -2273,14 +2301,19 @@ var taskClaimRects = []; // { taskId, x, y, w, h }
 var RANK_PANEL_W = 300;
 var RANK_PANEL_H = 380;
 var rankTab = 'friend'; // 'friend' | 'global'
-var friendRankType = 'score'; // 'score' | 'level' | 'stars'，好友排行子类型
+var friendRankType = 'score'; // 'score' | 'level' | 'stars'，好友排行子类型（仅积分时保留 score）
+var rankPeriod = 'day'; // 'day' | 'week' | 'month'，好友/全球共用的周期
 var globalRankList = [];
+var globalRankMyRank = null;
 var globalRankLoading = false;
 var btnRankFriendRect = null;
 var btnRankGlobalRect = null;
 var btnRankScoreRect = null;
 var btnRankLevelRect = null;
 var btnRankStarsRect = null;
+var btnRankDayRect = null;
+var btnRankWeekRect = null;
+var btnRankMonthRect = null;
 
 var btnStartContinueRect = null;
 var btnBackToMainRect = null;
@@ -2353,92 +2386,30 @@ function renderStart() {
   btnShareRect = { x: cx - rankBtnW / 2, y: y5, w: rankBtnW, h: rankBtnH };
 }
 
-function renderMap() {
-  ensureLevelMapPageInRange();
-  var w = canvas.width;
-  var h = canvas.height;
-  if (bgImage && bgImage.width > 0 && bgImage.height > 0) {
-    ctx.drawImage(bgImage, 0, 0, w, h);
-  } else {
-    ctx.fillStyle = '#16213e';
-    ctx.fillRect(0, 0, w, h);
-  }
-  var cellW = contentWidth / MAP_COLS;
-  var cellH = (contentHeight - MAP_TOP - MAP_BOTTOM) / MAP_ROWS;
-  ctx.fillStyle = '#eee';
-  ctx.font = '18px ' + FONT_FAMILY;
-  ctx.textAlign = 'center';
-  var maxUnlocked = saveData ? saveData.maxUnlockedLevel : 1;
-  var pageStart = levelMapPage * LEVELS_PER_PAGE + 1;
-  ctx.fillText('选择关卡（' + pageStart + '-' + (pageStart + LEVELS_PER_PAGE - 1) + '）', contentX + contentWidth / 2, contentY + 28);
-  for (var row = 0; row < MAP_ROWS; row++) {
-    for (var col = 0; col < MAP_COLS; col++) {
-      var levelId = levelMapPage * LEVELS_PER_PAGE + row * MAP_COLS + col + 1;
-      var x = contentX + col * cellW + 4;
-      var y = contentY + MAP_TOP + row * cellH + 4;
-      var boxW = cellW - 8;
-      var boxH = cellH - 8;
-      var locked = levelId > maxUnlocked;
-      ctx.fillStyle = locked ? '#3d3d5c' : '#2a4a7c';
-      ctx.fillRect(x, y, boxW, boxH);
-      ctx.strokeStyle = locked ? '#5c5c8a' : '#4a7c9e';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(x, y, boxW, boxH);
-      ctx.fillStyle = '#fff';
-      ctx.font = '14px ' + FONT_FAMILY;
-      ctx.fillText('' + levelId, x + boxW / 2, y + boxH / 2 - 6);
-      var stars = saveData && saveData.stars[levelId] != null ? saveData.stars[levelId] : 0;
-      ctx.font = '11px ' + FONT_FAMILY;
-      ctx.fillText('★'.repeat(stars) + '☆'.repeat(3 - stars), x + boxW / 2, y + boxH / 2 + 8);
-      if (locked) {
-        ctx.fillStyle = 'rgba(0,0,0,0.5)';
-        ctx.fillRect(x, y, boxW, boxH);
-      }
-    }
-  }
-  var barY = contentY + contentHeight - MAP_BOTTOM;
-  var btnH = 28;
-  var btnW = 56;
-  var prevX = contentX + contentWidth / 2 - btnW - 8;
-  var nextX = contentX + contentWidth / 2 + 8;
-  ctx.fillStyle = levelMapPage > 0 ? '#4a7c59' : '#3d3d5c';
-  ctx.fillRect(prevX, barY + 6, btnW, btnH);
-  ctx.strokeStyle = '#eee';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(prevX, barY + 6, btnW, btnH);
-  ctx.fillStyle = '#fff';
-  ctx.font = '14px ' + FONT_FAMILY;
-  ctx.fillText('上一页', prevX + btnW / 2, barY + 6 + btnH / 2 + 4);
-  btnMapPrevRect = levelMapPage > 0 ? { x: prevX, y: barY + 6, w: btnW, h: btnH } : null;
-  ctx.fillStyle = '#4a7c59';
-  ctx.fillRect(nextX, barY + 6, btnW, btnH);
-  ctx.strokeRect(nextX, barY + 6, btnW, btnH);
-  ctx.fillText('下一页', nextX + btnW / 2, barY + 6 + btnH / 2 + 4);
-  btnMapNextRect = { x: nextX, y: barY + 6, w: btnW, h: btnH };
-  var rankBtnW = 120;
-  var rankBtnH = 32;
-  var rankBtnX = contentX + (contentWidth - rankBtnW) / 2;
-  var rankBtnY = barY + 6 + btnH + 6;
-  ctx.fillStyle = '#4a7c59';
-  ctx.fillRect(rankBtnX, rankBtnY, rankBtnW, rankBtnH);
-  ctx.strokeStyle = '#eee';
-  ctx.strokeRect(rankBtnX, rankBtnY, rankBtnW, rankBtnH);
-  ctx.fillStyle = '#fff';
-  ctx.font = '15px ' + FONT_FAMILY;
-  ctx.fillText('排行榜', contentX + contentWidth / 2, rankBtnY + rankBtnH / 2 + 5);
-  btnRankRect = { x: rankBtnX, y: rankBtnY, w: rankBtnW, h: rankBtnH };
-}
-
 function openRankPanel() {
   gameScene = 'rank';
   rankTab = 'friend';
-  friendRankType = 'score';
+  rankPeriod = 'day';
+  if (typeof wx !== 'undefined' && typeof wx.getUserInfo === 'function' && currentUserId && typeof dataService !== 'undefined' && dataService.submitGlobalRank) {
+    wx.getUserInfo({
+      success: function (u) {
+        if (u && u.userInfo) {
+          var name = (u.userInfo.nickName || u.userInfo.nickname || '').trim();
+          if (name) {
+            userNickName = name;
+            dataService.submitGlobalRank(currentUserId, getTotalScoreForRank(), function () {}, userNickName);
+          }
+        }
+      }
+    });
+  }
   try {
     var openCtx = wx.getOpenDataContext && wx.getOpenDataContext();
     if (openCtx && openCtx.canvas) {
       openCtx.canvas.width = RANK_PANEL_W;
       openCtx.canvas.height = RANK_PANEL_H;
-      openCtx.postMessage({ type: 'refresh', rankType: 'score' });
+      var keys = getPeriodKeysInBeijing();
+      openCtx.postMessage({ type: 'refresh', periodType: 'day', periodKey: keys.day, env: CLOUD_ENV });
     }
   } catch (e) {}
   rankLoop();
@@ -2475,26 +2446,29 @@ function renderRank() {
   var contentTop = panelY + tabH + 4;
   var contentH = RANK_PANEL_H - tabH - 12;
   if (rankTab === 'friend') {
+    btnRankScoreRect = null;
+    btnRankLevelRect = null;
+    btnRankStarsRect = null;
     var subTabH = 28;
     var subTabW = (RANK_PANEL_W - 16) / 3;
     var subY = contentTop;
     contentTop = subY + subTabH + 4;
     contentH -= subTabH + 4;
-    ctx.fillStyle = friendRankType === 'score' ? '#4a7c59' : '#3d3d5c';
+    ctx.fillStyle = rankPeriod === 'day' ? '#4a7c59' : '#3d3d5c';
     ctx.fillRect(panelX + 4, subY, subTabW, subTabH);
     ctx.fillStyle = '#fff';
     ctx.font = '12px ' + FONT_FAMILY;
-    ctx.fillText('积分', panelX + 4 + subTabW / 2, subY + subTabH / 2 + 4);
+    ctx.fillText('日榜', panelX + 4 + subTabW / 2, subY + subTabH / 2 + 4);
     btnRankScoreRect = { x: panelX + 4, y: subY, w: subTabW, h: subTabH };
-    ctx.fillStyle = friendRankType === 'level' ? '#4a7c59' : '#3d3d5c';
+    ctx.fillStyle = rankPeriod === 'week' ? '#4a7c59' : '#3d3d5c';
     ctx.fillRect(panelX + 6 + subTabW, subY, subTabW, subTabH);
     ctx.fillStyle = '#fff';
-    ctx.fillText('关卡', panelX + 6 + subTabW + subTabW / 2, subY + subTabH / 2 + 4);
+    ctx.fillText('周榜', panelX + 6 + subTabW + subTabW / 2, subY + subTabH / 2 + 4);
     btnRankLevelRect = { x: panelX + 6 + subTabW, y: subY, w: subTabW, h: subTabH };
-    ctx.fillStyle = friendRankType === 'stars' ? '#4a7c59' : '#3d3d5c';
+    ctx.fillStyle = rankPeriod === 'month' ? '#4a7c59' : '#3d3d5c';
     ctx.fillRect(panelX + 8 + subTabW * 2, subY, subTabW, subTabH);
     ctx.fillStyle = '#fff';
-    ctx.fillText('星级', panelX + 8 + subTabW * 2 + subTabW / 2, subY + subTabH / 2 + 4);
+    ctx.fillText('月榜', panelX + 8 + subTabW * 2 + subTabW / 2, subY + subTabH / 2 + 4);
     btnRankStarsRect = { x: panelX + 8 + subTabW * 2, y: subY, w: subTabW, h: subTabH };
     try {
       var openCtx = wx.getOpenDataContext && wx.getOpenDataContext();
@@ -2506,6 +2480,27 @@ function renderRank() {
     btnRankScoreRect = null;
     btnRankLevelRect = null;
     btnRankStarsRect = null;
+    var subTabH = 28;
+    var subTabW = (RANK_PANEL_W - 16) / 3;
+    var subY = contentTop;
+    contentTop = subY + subTabH + 4;
+    contentH -= subTabH + 4;
+    ctx.fillStyle = rankPeriod === 'day' ? '#4a7c59' : '#3d3d5c';
+    ctx.fillRect(panelX + 4, subY, subTabW, subTabH);
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px ' + FONT_FAMILY;
+    ctx.fillText('日榜', panelX + 4 + subTabW / 2, subY + subTabH / 2 + 4);
+    btnRankDayRect = { x: panelX + 4, y: subY, w: subTabW, h: subTabH };
+    ctx.fillStyle = rankPeriod === 'week' ? '#4a7c59' : '#3d3d5c';
+    ctx.fillRect(panelX + 6 + subTabW, subY, subTabW, subTabH);
+    ctx.fillStyle = '#fff';
+    ctx.fillText('周榜', panelX + 6 + subTabW + subTabW / 2, subY + subTabH / 2 + 4);
+    btnRankWeekRect = { x: panelX + 6 + subTabW, y: subY, w: subTabW, h: subTabH };
+    ctx.fillStyle = rankPeriod === 'month' ? '#4a7c59' : '#3d3d5c';
+    ctx.fillRect(panelX + 8 + subTabW * 2, subY, subTabW, subTabH);
+    ctx.fillStyle = '#fff';
+    ctx.fillText('月榜', panelX + 8 + subTabW * 2 + subTabW / 2, subY + subTabH / 2 + 4);
+    btnRankMonthRect = { x: panelX + 8 + subTabW * 2, y: subY, w: subTabW, h: subTabH };
     ctx.fillStyle = '#16213e';
     ctx.fillRect(panelX + 4, contentTop, RANK_PANEL_W - 8, contentH);
     if (globalRankLoading) {
@@ -2522,13 +2517,24 @@ function renderRank() {
       var lineH = 28;
       var left = panelX + 12;
       var right = panelX + RANK_PANEL_W - 12;
+      if (globalRankMyRank && globalRankMyRank.rank) {
+        ctx.fillStyle = '#ffd93d';
+        ctx.font = '13px ' + FONT_FAMILY;
+        ctx.textAlign = 'left';
+        ctx.fillText('我的排名: 第' + globalRankMyRank.rank + '名', left, contentTop + 12);
+        ctx.textAlign = 'right';
+        ctx.fillText(String(globalRankMyRank.totalScore != null ? globalRankMyRank.totalScore : 0), right, contentTop + 12);
+        contentTop += 24;
+        contentH -= 24;
+      }
       for (var i = 0; i < globalRankList.length && (contentTop + 20 + (i + 1) * lineH) <= panelY + RANK_PANEL_H - 8; i++) {
         var item = globalRankList[i];
         var y = contentTop + 16 + i * lineH;
+        var nameStr = (item.nickName && String(item.nickName).trim()) ? String(item.nickName).slice(0, 8) : ((item.nickname && String(item.nickname).trim()) ? String(item.nickname).slice(0, 8) : ('玩家' + (item.rank || (i + 1))));
         ctx.fillStyle = '#fff';
         ctx.font = '13px ' + FONT_FAMILY;
         ctx.textAlign = 'left';
-        ctx.fillText('第' + (item.rank || (i + 1)) + '名', left, y + 16);
+        ctx.fillText('第' + (item.rank || (i + 1)) + '名 ' + nameStr, left, y + 16);
         ctx.textAlign = 'right';
         ctx.fillText(String(item.totalScore != null ? item.totalScore : 0), right, y + 16);
       }
@@ -3209,9 +3215,24 @@ function main() {
     dataService.ensureUser(function (res) {
       if (!res.ok || !res.userId) return;
       currentUserId = res.userId;
+      if (typeof wx.getUserInfo === 'function') {
+        wx.getUserInfo({
+          success: function (u) {
+            if (u && u.userInfo) {
+              var name = (u.userInfo.nickName || u.userInfo.nickname || '').trim();
+              if (name) {
+                userNickName = name;
+                if (currentUserId && typeof dataService.submitGlobalRank === 'function') {
+                  dataService.submitGlobalRank(currentUserId, getTotalScoreForRank(), function () {}, userNickName);
+                }
+              }
+            }
+          }
+        });
+      }
       persistProgressToCloud();
       if (currentUserId && typeof dataService.submitGlobalRank === 'function') {
-        dataService.submitGlobalRank(currentUserId, getTotalScoreForRank(), function () {});
+        dataService.submitGlobalRank(currentUserId, getTotalScoreForRank(), function () {}, userNickName);
       }
       dataService.getProgress(currentUserId, function (prog) {
         if (!prog.ok || !prog.data) return;
@@ -3245,7 +3266,7 @@ function main() {
           saveSave(saveData);
           rankDisplayScore = getTotalScoreForRank();
           if (currentUserId && typeof dataService.submitGlobalRank === 'function') {
-            dataService.submitGlobalRank(currentUserId, getTotalScoreForRank(), function () {});
+            dataService.submitGlobalRank(currentUserId, getTotalScoreForRank(), function () {}, userNickName);
           }
           renderStart();
         } else if (doRecoveryMerge) {

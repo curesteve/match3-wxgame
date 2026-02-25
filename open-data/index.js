@@ -1,14 +1,16 @@
 /**
- * 开放数据域入口：好友排行榜（积分 / 关卡 / 星级）
- * 微信要求 openDataContext 目录下提供 index.js 作为入口。
+ * 开放数据域入口：好友排行榜（仅积分，支持日/周/月榜）
  */
 var sharedCanvas = wx.getSharedCanvas();
 var ctx = sharedCanvas.getContext('2d');
-var RANK_KEYS = ['score', 'level', 'stars'];
+var RANK_KEY = 'score';
 var list = [];
 var loading = true;
 var errMsg = '';
-var currentRankType = 'score';
+var currentPeriodType = 'day';
+var currentPeriodKey = '';
+var cloudEnv = '';
+var useTotalScoreFallback = false;
 var FONT_FAMILY = '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", sans-serif';
 if (typeof wx !== 'undefined' && wx.loadFont) {
   try {
@@ -17,22 +19,11 @@ if (typeof wx !== 'undefined' && wx.loadFont) {
   } catch (e) {}
 }
 
-function getSortValue(item) {
-  if (currentRankType === 'level') return item.level != null ? item.level : 0;
-  if (currentRankType === 'stars') return item.stars != null ? item.stars : 0;
-  return item.score != null ? item.score : 0;
-}
-
-function getDisplayValue(item) {
-  if (currentRankType === 'level') return String(item.level != null ? item.level : 0);
-  if (currentRankType === 'stars') return String(item.stars != null ? item.stars : 0);
-  return String(item.score != null ? item.score : 0);
-}
-
-function getTitle() {
-  if (currentRankType === 'level') return '好友关卡排行';
-  if (currentRankType === 'stars') return '好友星级排行';
-  return '好友积分排行';
+function getPeriodTitle() {
+  if (useTotalScoreFallback) return '好友积分榜';
+  if (currentPeriodType === 'week') return '好友周榜';
+  if (currentPeriodType === 'month') return '好友月榜';
+  return '好友日榜';
 }
 
 function drawRank() {
@@ -51,7 +42,7 @@ function drawRank() {
     ctx.fillText(errMsg, w / 2, h / 2);
     return;
   }
-  ctx.fillText(getTitle(), w / 2, 24);
+  ctx.fillText(getPeriodTitle(), w / 2, 24);
   if (list.length === 0) {
     ctx.fillText('暂无好友数据', w / 2, h / 2);
     return;
@@ -60,45 +51,109 @@ function drawRank() {
   var y = 44;
   for (var i = 0; i < list.length && y < h - 20; i++) {
     var item = list[i];
-    var rank = i + 1;
+    var rank = item.rank != null ? item.rank : (i + 1);
     var name = (item.nickName || item.nickname || '') ? String(item.nickName || item.nickname).slice(0, 8) : ('玩家' + rank);
+    var score = item.totalScore != null ? item.totalScore : (item.score != null ? item.score : 0);
     ctx.fillStyle = '#fff';
     ctx.textAlign = 'left';
     ctx.fillText(rank + '. ' + name, 16, y + 20);
     ctx.textAlign = 'right';
-    ctx.fillText(getDisplayValue(item), w - 16, y + 20);
+    ctx.fillText(String(score), w - 16, y + 20);
     ctx.textAlign = 'center';
     y += lineH;
   }
 }
 
-function fetchAndDraw(rankType) {
-  currentRankType = rankType === 'level' || rankType === 'stars' ? rankType : 'score';
+function fetchAndDrawByPeriod(periodType, periodKey) {
+  currentPeriodType = periodType || 'day';
+  currentPeriodKey = periodKey || '';
   loading = true;
   errMsg = '';
   list = [];
   drawRank();
   wx.getFriendCloudStorage({
-    keyList: RANK_KEYS,
+    keyList: [RANK_KEY],
+    success: function (res) {
+      var friends = res.data || [];
+      var openids = friends.map(function (u) { return u.openid || u.openId || ''; }).filter(Boolean);
+      if (openids.length === 0) {
+        loading = false;
+        list = [];
+        drawRank();
+        return;
+      }
+      if (typeof wx.cloud === 'undefined' || !wx.cloud.callFunction) {
+        loading = false;
+        useTotalScoreFallback = true;
+        fetchAndDrawTotalScore();
+        return;
+      }
+      useTotalScoreFallback = false;
+      if (cloudEnv && typeof wx.cloud.init === 'function') {
+        try { wx.cloud.init({ env: cloudEnv }); } catch (e) {}
+      }
+      wx.cloud.callFunction({
+        name: 'rankListByOpenids',
+        data: { openids: openids, periodType: currentPeriodType, periodKey: currentPeriodKey }
+      }).then(function (cfRes) {
+        loading = false;
+        var result = cfRes.result || {};
+        var cloudList = (result.ok && result.list) ? result.list : [];
+        var nameMap = {};
+        for (var i = 0; i < friends.length; i++) {
+          var o = friends[i].openid || friends[i].openId;
+          if (o) nameMap[o] = friends[i].nickname || friends[i].nickName || '';
+        }
+        list = cloudList.map(function (item) {
+          return {
+            rank: item.rank,
+            userId: item.userId,
+            totalScore: item.totalScore,
+            nickName: nameMap[item.userId] || ('玩家' + (item.rank || 0))
+          };
+        });
+        drawRank();
+      }).catch(function () {
+        loading = false;
+        errMsg = '加载失败';
+        drawRank();
+      });
+    },
+    fail: function () {
+      loading = false;
+      errMsg = '获取失败';
+      drawRank();
+    }
+  });
+}
+
+function fetchAndDrawTotalScore() {
+  currentPeriodType = 'day';
+  currentPeriodKey = '';
+  useTotalScoreFallback = true;
+  loading = true;
+  errMsg = '';
+  list = [];
+  drawRank();
+  wx.getFriendCloudStorage({
+    keyList: [RANK_KEY],
     success: function (res) {
       loading = false;
       var data = res.data || [];
-      list = data.map(function (user) {
-        var score = 0, level = 0, stars = 0;
+      list = data.map(function (user, idx) {
+        var score = 0;
         var kvList = user.KVDataList || user.kvDataList || user.data || [];
         for (var j = 0; j < kvList.length; j++) {
           var k = kvList[j].key || kvList[j].keyName;
-          var v = parseInt(kvList[j].value || kvList[j].valueStr || '0', 10) || 0;
-          if (k === 'score') score = v;
-          else if (k === 'level') level = v;
-          else if (k === 'stars') stars = v;
+          if (k === RANK_KEY) score = parseInt(kvList[j].value || kvList[j].valueStr || '0', 10) || 0;
         }
-        return { nickName: user.nickname || user.nickName, score: score, level: level, stars: stars, openid: user.openid };
+        return { nickName: user.nickname || user.nickName, score: score, totalScore: score, openid: user.openid };
       });
-      list.sort(function (a, b) { return getSortValue(b) - getSortValue(a); });
+      list.sort(function (a, b) { return (b.totalScore || 0) - (a.totalScore || 0); });
+      for (var i = 0; i < list.length; i++) list[i].rank = i + 1;
       drawRank();
     },
-    fail: function (err) {
+    fail: function () {
       loading = false;
       errMsg = '获取失败';
       drawRank();
@@ -156,30 +211,27 @@ function fetchAndDrawMinipanel(myScore) {
     drawMinipanel('timeout', null);
   }, 2500);
   wx.getFriendCloudStorage({
-    keyList: RANK_KEYS,
+    keyList: [RANK_KEY],
     success: function (res) {
       finish();
       loading = false;
       var data = res.data || [];
-      var list = data.map(function (user) {
-        var score = 0, level = 0, stars = 0;
+      var arr = data.map(function (user) {
+        var score = 0;
         var kvList = user.KVDataList || user.kvDataList || user.data || [];
         for (var j = 0; j < kvList.length; j++) {
           var k = kvList[j].key || kvList[j].keyName;
-          var v = parseInt(kvList[j].value || kvList[j].valueStr || '0', 10) || 0;
-          if (k === 'score') score = v;
-          else if (k === 'level') level = v;
-          else if (k === 'stars') stars = v;
+          if (k === RANK_KEY) score = parseInt(kvList[j].value || kvList[j].valueStr || '0', 10) || 0;
         }
-        return { score: score, level: level, stars: stars };
+        return { score: score };
       });
-      list.sort(function (a, b) { return (b.score || 0) - (a.score || 0); });
+      arr.sort(function (a, b) { return (b.score || 0) - (a.score || 0); });
       var rank = 1;
       var gapAbove = null;
-      for (var i = 0; i < list.length; i++) {
-        if (list[i].score > myScore) {
+      for (var i = 0; i < arr.length; i++) {
+        if (arr[i].score > myScore) {
           rank++;
-          if (gapAbove == null) gapAbove = list[i].score;
+          if (gapAbove == null) gapAbove = arr[i].score;
         }
       }
       if (gapAbove != null) gapAbove = gapAbove - myScore;
@@ -194,8 +246,18 @@ function fetchAndDrawMinipanel(myScore) {
 }
 
 wx.onMessage(function (msg) {
+  if (msg.env) {
+    cloudEnv = msg.env;
+    if (typeof wx.cloud !== 'undefined' && typeof wx.cloud.init === 'function') {
+      try { wx.cloud.init({ env: cloudEnv }); } catch (e) {}
+    }
+  }
   if (msg.type === 'refresh') {
-    fetchAndDraw(msg.rankType || 'score');
+    if (msg.periodType && msg.periodKey) {
+      fetchAndDrawByPeriod(msg.periodType, msg.periodKey);
+    } else {
+      fetchAndDrawTotalScore();
+    }
   } else if (msg.type === 'minipanel' && msg.score != null) {
     fetchAndDrawMinipanel(Number(msg.score));
   }

@@ -10,3 +10,6 @@ Thumbs.db
 
 # 云函数依赖（云端安装）
 cloudfunctions/*/node_modules/
+
+# Cursor 索引缓存（避免预览/上传时 ENOENT postings.bin）
+.git/cursor/
